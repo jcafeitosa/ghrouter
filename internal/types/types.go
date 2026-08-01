@@ -11,18 +11,18 @@ type Config struct {
 
 // Provider represents a backend provider (CLI-based)
 type Provider struct {
-	Name        string            `yaml:"name"`
-	Type        ProviderType      `yaml:"type"`
-	CLIPath     string            `yaml:"cli_path"`
-	Args        []string          `yaml:"args"`
-	Env         map[string]string `yaml:"env"`
-	Models      []string          `yaml:"models"`
-	Timeout     time.Duration     `yaml:"timeout"`
-	MaxTokens   int               `yaml:"max_tokens"`
-	WorkDir     string            `yaml:"work_dir"`
-	AuthMethod  AuthMethod        `yaml:"auth_method"`
-	AuthConfig  map[string]string `yaml:"auth_config"`
-	Enabled     bool              `yaml:"enabled"`
+	Name       string            `yaml:"name"`
+	Type       ProviderType      `yaml:"type"`
+	CLIPath    string            `yaml:"cli_path"`
+	Args       []string          `yaml:"args"`
+	Env        map[string]string `yaml:"env"`
+	Models     []string          `yaml:"models"`
+	Timeout    time.Duration     `yaml:"timeout"`
+	MaxTokens  int               `yaml:"max_tokens"`
+	WorkDir    string            `yaml:"work_dir"`
+	AuthMethod AuthMethod        `yaml:"auth_method"`
+	AuthConfig map[string]string `yaml:"auth_config"`
+	Enabled    bool              `yaml:"enabled"`
 }
 
 // ProviderType identifies the provider kind
@@ -45,9 +45,9 @@ const (
 type AuthMethod string
 
 const (
-	AuthNone     AuthMethod = "none"
-	AuthEnv      AuthMethod = "env"
-	AuthFile     AuthMethod = "file"
+	AuthNone       AuthMethod = "none"
+	AuthEnv        AuthMethod = "env"
+	AuthFile       AuthMethod = "file"
 	AuthSubprocess AuthMethod = "subprocess"
 )
 
@@ -73,17 +73,17 @@ type OpenAIRequest struct {
 
 // OpenAIMessage represents a message in the conversation
 type OpenAIMessage struct {
-	Role       string          `json:"role"`
-	Content    any             `json:"content"`
-	Name       string          `json:"name,omitempty"`
+	Role       string           `json:"role"`
+	Content    any              `json:"content"`
+	Name       string           `json:"name,omitempty"`
 	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 // OpenAIToolCall represents a tool call
 type OpenAIToolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
+	ID       string         `json:"id"`
+	Type     string         `json:"type"`
 	Function OpenAIFunction `json:"function"`
 }
 
@@ -108,12 +108,12 @@ type OpenAIToolFunc struct {
 
 // OpenAIResponse is the response back to gh copilot
 type OpenAIResponse struct {
-	ID      string           `json:"id"`
-	Object  string           `json:"object"`
-	Created int64            `json:"created"`
-	Model   string           `json:"model"`
-	Choices []OpenAIChoice   `json:"choices"`
-	Usage   OpenAIUsage      `json:"usage"`
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []OpenAIChoice `json:"choices"`
+	Usage   OpenAIUsage    `json:"usage"`
 }
 
 // OpenAIChoice represents a completion choice
@@ -132,11 +132,11 @@ type OpenAIUsage struct {
 
 // StreamChunk for streaming responses
 type StreamChunk struct {
-	ID      string            `json:"id"`
-	Object  string            `json:"object"`
-	Created int64             `json:"created"`
-	Model   string            `json:"model"`
-	Choices []StreamChoice    `json:"choices"`
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []StreamChoice `json:"choices"`
 }
 
 type StreamChoice struct {
@@ -146,7 +146,7 @@ type StreamChoice struct {
 }
 
 type StreamDelta struct {
-	Role      string          `json:"role,omitempty"`
-	Content   string          `json:"content,omitempty"`
+	Role      string           `json:"role,omitempty"`
+	Content   string           `json:"content,omitempty"`
 	ToolCalls []OpenAIToolCall `json:"tool_calls,omitempty"`
 }

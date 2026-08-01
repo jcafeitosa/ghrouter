@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"ghrouter/internal/types"
@@ -73,11 +75,11 @@ func (r *ProviderRunner) Invoke(ctx context.Context, req *types.OpenAIRequest) (
 
 // StreamEvent represents a streaming response chunk
 type StreamEvent struct {
-	ID      string
-	Model   string
-	Delta   string
-	Done    bool
-	Error   error
+	ID    string
+	Model string
+	Delta string
+	Done  bool
+	Error error
 }
 
 func (r *ProviderRunner) executeCLI(ctx context.Context, req *types.OpenAIRequest) (string, error) {

@@ -3,7 +3,6 @@ package config
 import (
 	"os"
 	"path/filepath"
-	"time"
 
 	"ghrouter/internal/types"
 
@@ -35,11 +34,4 @@ func ResolveConfigPath(raw string) string {
 		}
 	}
 	return raw
-}
-
-func (p *types.Provider) EffectiveTimeout() time.Duration {
-	if p.Timeout > 0 {
-		return p.Timeout
-	}
-	return 5 * time.Minute
 }

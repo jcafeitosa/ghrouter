@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 3,
+  "transport": "codex_app",
+  "teamId": "6de9108a-e177-4649-b7aa-ae455dd7db1a",
+  "teamName": "ghrouter-professional-flow",
+  "sessionName": "ghrouter-governance",
+  "sessionId": "team-4b647daf",
+  "threadTitleConvention": "[ghrouter-professional-flow] <member name>",
+  "status": "active",
+  "createdAt": "2026-08-01T21:52:37.962Z",
+  "updatedAt": "2026-08-01T21:56:36.691Z",
+  "archivedAt": null,
+  "leader": {
+    "kind": "main-session",
+    "sessionId": "team-4b647daf",
+    "agentPath": null
+  },
+  "communication": {
+    "memberLanguage": "english",
+    "replyToUserInUserLanguage": true
+  },
+  "worktree": {
+    "enabled": true,
+    "baseBranch": "master",
+    "root": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees"
+  },
+  "paths": {
+    "dir": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf",
+    "team": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/team.json",
+    "guide": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/guide.md",
+    "artifacts": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/artifacts"
+  },
+  "members": [
+    {
+      "id": "A",
+      "name": "github-foundation-executor",
+      "focus": "professional GitHub foundation files and repository workflow policy",
+      "lens": "ownership",
+      "deliverable": "Plan and implement only .gitignore, .github workflow/repository metadata, and related documentation; do not touch blocked product code; report exact diff and validation.",
+      "taskName": null,
+      "agentPath": null,
+      "threadId": "019fbf52-b35e-7f00-8b0c-212d6a1423e6",
+      "threadTitle": "[ghrouter-professional-flow] github-foundation-executor",
+      "cwd": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A",
+      "worktree": {
+        "path": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A",
+        "branch": "team/team-4b647daf/A"
+      },
+      "status": "active"
+    },
+    {
+      "id": "B",
+      "name": "github-foundation-critical-reviewer",
+      "focus": "independent critique of the executor's GitHub foundation plan and diff",
+      "lens": "perspective",
+      "deliverable": "Review scope, security, CI correctness, worktree safety, and release readiness; return findings and approval or required changes without editing files.",
+      "taskName": null,
+      "agentPath": null,
+      "threadId": "019fbf52-b346-7ec3-aa17-a3059dcd44f4",
+      "threadTitle": "[ghrouter-professional-flow] github-foundation-critical-reviewer",
+      "cwd": "/Users/jcafeitosa/Develop/Ghrouter",
+      "worktree": {
+        "path": "/Users/jcafeitosa/Develop/Ghrouter",
+        "branch": null
+      },
+      "status": "active"
+    },
+    {
+      "id": "C",
+      "name": "github-steward-monitor",
+      "focus": "all GitHub operations and ongoing repository monitoring: remote, branches, CI, PRs, checks, release status, and publication safety",
+      "lens": "ownership",
+      "deliverable": "Maintain a current GitHub status report, propose and execute only authorized GitHub actions, monitor CI/PR state, and coordinate publication gates without touching product implementation files.",
+      "taskName": null,
+      "agentPath": null,
+      "threadId": "019fbf52-b742-7951-94e8-42f024c6435e",
+      "threadTitle": "[ghrouter-professional-flow] github-steward-monitor",
+      "cwd": "/Users/jcafeitosa/Develop/Ghrouter",
+      "worktree": {
+        "path": "/Users/jcafeitosa/Develop/Ghrouter",
+        "branch": null
+      },
+      "status": "active"
+    },
+    {
+      "id": "D",
+      "name": "code-review-gate",
+      "focus": "independent code review of the executor's final diff and tests",
+      "lens": "perspective",
+      "deliverable": "Review implementation quality, correctness, security, regressions, tests, and scope; return severity-ordered findings and approval.",
+      "taskName": null,
+      "agentPath": null,
+      "threadId": "019fbf54-1d77-7f61-8b29-33e542cf862e",
+      "threadTitle": "[ghrouter-professional-flow] code-review-gate",
+      "cwd": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A",
+      "worktree": {
+        "path": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A",
+        "branch": null
+      },
+      "status": "active"
+    },
+    {
+      "id": "E",
+      "name": "runtime-qa-gate",
+      "focus": "independent QA of the validated GitHub foundation and repository gates",
+      "lens": "perspective",
+      "deliverable": "Run the required build/test/vet/format checks and manual repository/runtime checks; report evidence, failures, and PASS/FAIL without editing product code.",
+      "taskName": null,
+      "agentPath": null,
+      "threadId": "019fbf54-1f99-7fc1-9635-0278b0a98cc9",
+      "threadTitle": "[ghrouter-professional-flow] runtime-qa-gate",
+      "cwd": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A",
+      "worktree": {
+        "path": "/Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A",
+        "branch": null
+      },
+      "status": "active"
+    }
+  ],
+  "log": [
+    {
+      "ts": "2026-08-01T21:52:37.962Z",
+      "event": "created",
+      "detail": "team ghrouter-professional-flow"
+    },
+    {
+      "ts": "2026-08-01T21:52:51.390Z",
+      "event": "add-member",
+      "detail": "member A (ownership): professional GitHub foundation files and repository workflow policy"
+    },
+    {
+      "ts": "2026-08-01T21:52:51.477Z",
+      "event": "add-member",
+      "detail": "member B (perspective): independent critique of the executor's GitHub foundation plan and diff"
+    },
+    {
+      "ts": "2026-08-01T21:53:07.651Z",
+      "event": "add-member",
+      "detail": "member C (ownership): all GitHub operations and ongoing repository monitoring: remote, branches, CI, PRs, checks, release status, and publication safety"
+    },
+    {
+      "ts": "2026-08-01T21:53:22.141Z",
+      "event": "worktree-add",
+      "detail": "member A -> /Users/jcafeitosa/Develop/Ghrouter/.omo/teams/team-4b647daf/worktrees/A (team/team-4b647daf/A)"
+    },
+    {
+      "ts": "2026-08-01T21:55:07.208Z",
+      "event": "bind-thread",
+      "detail": "member B -> thread 019fbf52-b346-7ec3-aa17-a3059dcd44f4"
+    },
+    {
+      "ts": "2026-08-01T21:55:07.290Z",
+      "event": "bind-thread",
+      "detail": "member C -> thread 019fbf52-b742-7951-94e8-42f024c6435e"
+    },
+    {
+      "ts": "2026-08-01T21:55:39.653Z",
+      "event": "bind-thread",
+      "detail": "member A -> thread 019fbf52-b35e-7f00-8b0c-212d6a1423e6"
+    },
+    {
+      "ts": "2026-08-01T21:56:16.819Z",
+      "event": "add-member",
+      "detail": "member D (perspective): independent code review of the executor's final diff and tests"
+    },
+    {
+      "ts": "2026-08-01T21:56:16.910Z",
+      "event": "add-member",
+      "detail": "member E (perspective): independent QA of the validated GitHub foundation and repository gates"
+    },
+    {
+      "ts": "2026-08-01T21:56:36.605Z",
+      "event": "bind-thread",
+      "detail": "member D -> thread 019fbf54-1d77-7f61-8b29-33e542cf862e"
+    },
+    {
+      "ts": "2026-08-01T21:56:36.691Z",
+      "event": "bind-thread",
+      "detail": "member E -> thread 019fbf54-1f99-7fc1-9635-0278b0a98cc9"
+    }
+  ]
+}

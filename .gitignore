@@ -1,0 +1,28 @@
+# Build output
+/ghrouter
+*.test
+*.out
+
+# Local configuration and credentials
+/config.yaml
+/config.local.yaml
+*.local.yaml
+*.local.yml
+.env
+.env.*
+!.env.example
+
+# Coverage and profiling artifacts
+coverage.out
+coverage.html
+profile.cov
+
+# IDE and OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Temporary files
+tmp/
+*.swp
+*.swo
