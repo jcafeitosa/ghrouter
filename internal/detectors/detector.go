@@ -111,11 +111,28 @@ func EnrichProviderModels(provider *types.Provider) {
 		return
 	}
 	merged := make(map[string]types.ModelInfo, len(provider.ModelInfo)+len(provider.Models))
+	canonicalModels := make([]string, 0, len(provider.Models)+len(provider.ModelInfo))
+	seen := make(map[string]struct{}, len(provider.Models)+len(provider.ModelInfo))
+	add := func(model string) {
+		model = canonicalModelReference(provider, model)
+		if model == "" {
+			return
+		}
+		if _, ok := seen[model]; ok {
+			return
+		}
+		seen[model] = struct{}{}
+		canonicalModels = append(canonicalModels, model)
+	}
+	for _, model := range provider.Models {
+		add(model)
+	}
 	for key, info := range provider.ModelInfo {
 		model := canonicalModelReference(provider, key)
 		if model == "" {
 			continue
 		}
+		add(model)
 		info.Provider = provider.Name
 		info.Model = model
 		if info.Source == "" {
@@ -123,27 +140,8 @@ func EnrichProviderModels(provider *types.Provider) {
 		}
 		merged[model] = info
 	}
-	normalized := make([]string, 0, len(provider.Models))
-	seen := make(map[string]struct{}, len(provider.Models))
-	for _, model := range provider.Models {
-		model = canonicalModelReference(provider, model)
-		if model == "" {
-			continue
-		}
-		if _, ok := seen[model]; ok {
-			continue
-		}
-		seen[model] = struct{}{}
-		normalized = append(normalized, model)
-		info := merged[model]
-		info.Provider = provider.Name
-		info.Model = model
-		if info.Source == "" {
-			info.Source = "configured"
-		}
-		merged[model] = info
-	}
-	provider.Models = normalized
+	sort.Strings(canonicalModels)
+	provider.Models = canonicalModels
 	provider.ModelInfo = merged
 }
 
@@ -158,7 +156,7 @@ func specsAuthAllowlist(providerType types.ProviderType) []string {
 	case types.ProviderMimo:
 		return []string{"OPENAI_API_KEY", "MIMO_API_KEY", "MIMO_HOME"}
 	case types.ProviderPi:
-		return []string{"PI_HOME", "OPENAI_API_KEY"}
+		return []string{"PI_HOME", "OPENAI_API_KEY", "GOOGLE_API_KEY", "PI_API_KEY"}
 	case types.ProviderCursor:
 		return []string{"CURSOR_API_KEY", "CURSOR_API_ENDPOINT"}
 	default:
@@ -178,8 +176,13 @@ func classifyProviderCapability(path string, providerType types.ProviderType, ac
 	}
 	switch providerType {
 	case types.ProviderOpenCode, types.ProviderMimo:
+		if ok && acpProbeEnabled {
+			if probeACPInitialize(path) {
+				return "acp", "native_cli", "supported", ""
+			}
+		}
 		if ok {
-			return "acp", "native_cli", "supported", ""
+			return "native_cli", "native_cli", "unsupported", "ACP initialize handshake not confirmed"
 		}
 		return "native_cli", "native_cli", "unsupported", "help output does not advertise acp"
 	case types.ProviderPi:
@@ -187,6 +190,74 @@ func classifyProviderCapability(path string, providerType types.ProviderType, ac
 	default:
 		return "native_cli", "native_cli", "unsupported", "native cli contract"
 	}
+}
+
+func probeACPInitialize(path string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "acp")
+	prepareDiscoveryCommand(cmd)
+	stdout, stderr, err := runACPInitialize(ctx, cmd)
+	if ctx.Err() != nil || err != nil {
+		return false
+	}
+	return hasACPInitializeSuccess(stdout, stderr)
+}
+
+func runACPInitialize(ctx context.Context, cmd *exec.Cmd) ([]byte, []byte, error) {
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, nil, err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		return nil, nil, err
+	}
+	payload := []byte(`{"method":"initialize","protocolVersion":1,"capabilities":{"catalog":true},"authMethods":["env"]}` + "\n")
+	go func() {
+		defer stdin.Close()
+		_, _ = stdin.Write(payload)
+	}()
+	stdoutBytes, _ := io.ReadAll(stdout)
+	stderrBytes, _ := io.ReadAll(stderr)
+	if err := cmd.Wait(); err != nil {
+		return stdoutBytes, stderrBytes, err
+	}
+	return stdoutBytes, stderrBytes, nil
+}
+
+func hasACPInitializeSuccess(stdout, stderr []byte) bool {
+	if len(stdout) == 0 && len(stderr) == 0 {
+		return false
+	}
+	joined := append(append([]byte(nil), stdout...), stderr...)
+	if bytes.Contains(bytes.ToLower(joined), []byte("\"error\"")) || bytes.Contains(bytes.ToLower(joined), []byte("method not found")) || bytes.Contains(bytes.ToLower(joined), []byte("invalid params")) {
+		return false
+	}
+	type initializeResponse struct {
+		ProtocolVersion any            `json:"protocolVersion"`
+		Result          map[string]any `json:"result"`
+	}
+	var resp initializeResponse
+	if err := json.NewDecoder(bytes.NewReader(stdout)).Decode(&resp); err == nil {
+		if resp.ProtocolVersion != nil {
+			return true
+		}
+		if len(resp.Result) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func probeHelpForACP(path string) (bool, string, string) {

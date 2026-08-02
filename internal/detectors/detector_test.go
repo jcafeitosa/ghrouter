@@ -20,7 +20,9 @@ func TestDetectAllUsesNativeHelpAndDiscovery(t *testing.T) {
 	t.Setenv("PATH", tmpDir)
 	t.Setenv("ANTHROPIC_API_KEY", "anthropic-key")
 	t.Setenv("OPENAI_API_KEY", "openai-key")
+	t.Setenv("GOOGLE_API_KEY", "google-key")
 	t.Setenv("MIMO_API_KEY", "mimo-key")
+	t.Setenv("PI_API_KEY", "pi-key")
 	t.Setenv("PI_HOME", filepath.Join(tmpDir, "pi-home"))
 	t.Setenv("CURSOR_API_KEY", "cursor-key")
 
@@ -65,6 +67,15 @@ if [ "$1" = "models" ]; then
   printf '}\n\n'
   exit 0
 fi
+if [ "$1" = "acp" ]; then
+  payload="$(cat)"
+  case "$payload" in
+    *'"method":"initialize"'*'"protocolVersion":1'*)
+      printf 'error: Method not found: initialize\n' >&2
+      exit 1
+      ;;
+  esac
+fi
 exit 1
 `)
 	writeShim(t, filepath.Join(tmpDir, "mimo"), `#!/bin/sh
@@ -77,6 +88,15 @@ fi
 if [ "$1" = "models" ]; then
   printf 'mimo/test-model\n'
   exit 0
+fi
+if [ "$1" = "acp" ]; then
+  payload="$(cat)"
+  case "$payload" in
+    *'"method":"initialize"'*'"protocolVersion":1'*)
+      printf 'error: Method not found: initialize\n' >&2
+      exit 1
+      ;;
+  esac
 fi
 exit 1
 `)
@@ -151,22 +171,24 @@ exit 1
 			wantFailKeyword: "native cli contract",
 		},
 		{
-			provider:       types.ProviderOpenCode,
-			wantProtocol:   "acp",
-			wantOrigin:     "native_cli",
-			wantCapability: "supported",
-			wantDiscovery:  types.DiscoverySuccess,
-			wantModels:     []string{"oc/nemotron-3-ultra-free"},
-			wantEnvKeys:    []string{"OPENAI_API_KEY", "PATH"},
+			provider:        types.ProviderOpenCode,
+			wantProtocol:    "native_cli",
+			wantOrigin:      "native_cli",
+			wantCapability:  "unsupported",
+			wantDiscovery:   types.DiscoverySuccess,
+			wantModels:      []string{"oc/nemotron-3-ultra-free"},
+			wantEnvKeys:     []string{"OPENAI_API_KEY", "PATH"},
+			wantFailKeyword: "ACP initialize handshake not confirmed",
 		},
 		{
-			provider:       types.ProviderMimo,
-			wantProtocol:   "acp",
-			wantOrigin:     "native_cli",
-			wantCapability: "supported",
-			wantDiscovery:  types.DiscoverySuccess,
-			wantModels:     []string{"mi/test-model"},
-			wantEnvKeys:    []string{"MIMO_API_KEY", "OPENAI_API_KEY", "PATH"},
+			provider:        types.ProviderMimo,
+			wantProtocol:    "native_cli",
+			wantOrigin:      "native_cli",
+			wantCapability:  "unsupported",
+			wantDiscovery:   types.DiscoverySuccess,
+			wantModels:      []string{"mi/test-model"},
+			wantEnvKeys:     []string{"MIMO_API_KEY", "OPENAI_API_KEY", "PATH"},
+			wantFailKeyword: "ACP initialize handshake not confirmed",
 		},
 		{
 			provider:        types.ProviderPi,
@@ -175,7 +197,7 @@ exit 1
 			wantCapability:  "unsupported",
 			wantDiscovery:   types.DiscoverySuccess,
 			wantModels:      []string{"pi/anthropic/claude-sonnet-5"},
-			wantEnvKeys:     []string{"OPENAI_API_KEY", "PI_HOME", "PATH"},
+			wantEnvKeys:     []string{"OPENAI_API_KEY", "GOOGLE_API_KEY", "PI_API_KEY", "PI_HOME", "PATH"},
 			wantFailKeyword: "native rpc contract",
 		},
 		{
@@ -230,6 +252,53 @@ exit 1
 	assertContains(t, filepath.Join(tmpDir, "mimo.calls"), "models")
 	assertContains(t, filepath.Join(tmpDir, "pi.calls"), "--list-models")
 	assertContains(t, filepath.Join(tmpDir, "cursor.calls"), "agent --list-models")
+}
+
+func TestHasACPInitializeSuccessRecognizesInitializeResponse(t *testing.T) {
+	if !hasACPInitializeSuccess(
+		[]byte("{\"protocolVersion\":1,\"agentCapabilities\":{\"catalog\":true},\"authMethods\":[\"env\"],\"agentInfo\":{\"name\":\"opencode\"}}\n"),
+		nil,
+	) {
+		t.Fatal("expected initialize response to be recognized")
+	}
+	if hasACPInitializeSuccess(nil, []byte("error: Method not found: initialize\n")) {
+		t.Fatal("expected initialize error to be rejected")
+	}
+}
+
+func TestEnrichProviderModelsPromotesConfiguredModelInfoIntoInventory(t *testing.T) {
+	provider := &types.Provider{
+		Name:   "opencode",
+		Type:   types.ProviderOpenCode,
+		Models: []string{"oc/from-cli", "opencode/from-name"},
+		ModelInfo: map[string]types.ModelInfo{
+			"oc/from-cli": {
+				Source:        "native",
+				VerifiedAt:    time.Unix(100, 0).UTC(),
+				Thinking:      true,
+				ContextWindow: 1_000_000,
+			},
+			"configured-only": {
+				Source:            "configured",
+				VerifiedAt:        time.Unix(200, 0).UTC(),
+				HealthStatus:      "healthy",
+				CooldownUntil:     time.Time{},
+				VerificationError: "",
+			},
+		},
+	}
+
+	EnrichProviderModels(provider)
+
+	if !reflect.DeepEqual(provider.Models, []string{"oc/configured-only", "oc/from-cli", "oc/from-name"}) {
+		t.Fatalf("unexpected canonical models: %#v", provider.Models)
+	}
+	if got := provider.ModelInfo["oc/from-cli"]; got.Source != "native" || got.Model != "oc/from-cli" || got.Provider != "opencode" {
+		t.Fatalf("unexpected model info for oc/from-cli: %#v", got)
+	}
+	if got := provider.ModelInfo["oc/configured-only"]; got.Source != "configured" || got.Model != "oc/configured-only" || got.Provider != "opencode" {
+		t.Fatalf("unexpected model info for oc/configured-only: %#v", got)
+	}
 }
 
 func TestDiscoveryStatusesAreTypedForUnsupportedTimeoutAndAuth(t *testing.T) {

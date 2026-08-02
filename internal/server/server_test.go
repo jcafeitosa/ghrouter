@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ghrouter/internal/detectors"
 	"ghrouter/internal/providers"
 	"ghrouter/internal/types"
 )
@@ -84,6 +86,120 @@ func TestHandleModelsUsesCanonicalIDsAndSkipsCooldown(t *testing.T) {
 	}
 	if members := lists["ghrouter/codex"]; len(members) != 1 || members[0] != "cx/gpt-5" {
 		t.Fatalf("expected provider list to keep only eligible canonical model, got %+v", members)
+	}
+}
+
+func TestLiveSnapshotIncludesConfiguredModelInfoOnlyAndExcludesCooldown(t *testing.T) {
+	cfg := &types.Config{
+		Providers: []*types.Provider{
+			{
+				Name:    "opencode",
+				Type:    types.ProviderOpenCode,
+				Enabled: true,
+				ModelInfo: map[string]types.ModelInfo{
+					"oc/good": {
+						Source:        "configured",
+						VerifiedAt:    time.Unix(100, 0).UTC(),
+						HealthStatus:  "healthy",
+						ContextWindow: 1_000_000,
+						Thinking:      true,
+					},
+					"oc/bad": {
+						Source:        "configured",
+						HealthStatus:  "failed",
+						CooldownUntil: time.Now().Add(time.Hour),
+					},
+				},
+			},
+		},
+	}
+	detectors.EnrichProviderModels(cfg.Providers[0])
+
+	srv := NewWithConfigPath(cfg, filepath.Join(t.TempDir(), "config.yaml"))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rec := httptest.NewRecorder()
+	srv.handleModels(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	var payload struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID         string   `json:"id"`
+			Object     string   `json:"object"`
+			Created    int64    `json:"created"`
+			OwnedBy    string   `json:"owned_by"`
+			Provenance string   `json:"provenance"`
+			List       bool     `json:"list"`
+			Members    []string `json:"members"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("unmarshal model list: %v", err)
+	}
+	if payload.Object != "list" {
+		t.Fatalf("expected list object, got %+v", payload)
+	}
+	var directModels []struct {
+		ID         string
+		OwnedBy    string
+		Provenance string
+	}
+	for _, entry := range payload.Data {
+		if entry.List {
+			if entry.ID == "ghrouter/auto" && (len(entry.Members) != 1 || entry.Members[0] != "oc/good") {
+				t.Fatalf("expected auto list to keep verified canonical model only, got %+v", entry)
+			}
+			continue
+		}
+		directModels = append(directModels, struct {
+			ID         string
+			OwnedBy    string
+			Provenance string
+		}{ID: entry.ID, OwnedBy: entry.OwnedBy, Provenance: entry.Provenance})
+		if entry.ID == "oc/bad" {
+			t.Fatalf("expected failed/cooldown model to be excluded, got %+v", entry)
+		}
+	}
+	if len(directModels) != 1 {
+		t.Fatalf("expected one direct live model, got %+v", directModels)
+	}
+	entry := directModels[0]
+	if entry.ID != "oc/good" || entry.OwnedBy != "opencode" {
+		t.Fatalf("unexpected live model entry: %+v", entry)
+	}
+	if entry.Provenance != "verified" {
+		t.Fatalf("expected verified provenance, got %+v", entry)
+	}
+	snapshot := srv.LiveSnapshot()
+	var snapshotDirect []string
+	var snapshotLists map[string][]string
+	for _, model := range snapshot.Models {
+		if model.List {
+			if snapshotLists == nil {
+				snapshotLists = make(map[string][]string)
+			}
+			snapshotLists[model.ID] = append([]string(nil), model.Members...)
+			continue
+		}
+		snapshotDirect = append(snapshotDirect, model.ID)
+		if model.ID == "oc/bad" {
+			t.Fatalf("expected failed/cooldown model to stay excluded from snapshot, got %+v", model)
+		}
+		if model.ID == "oc/good" && model.Provenance != "verified" {
+			t.Fatalf("expected verified provenance, got %+v", model)
+		}
+	}
+	if len(snapshotDirect) != 1 || snapshotDirect[0] != "oc/good" {
+		t.Fatalf("expected one direct verified model in snapshot, got %+v", snapshotDirect)
+	}
+	if members := snapshotLists["ghrouter/auto"]; len(members) != 1 || members[0] != "oc/good" {
+		t.Fatalf("expected auto list to keep verified canonical model only, got %+v", members)
+	}
+	if providers := snapshot.Providers; len(providers) != 1 || len(providers[0].Models) != 1 || providers[0].Models[0] != "oc/good" {
+		t.Fatalf("expected only the verified canonical provider model in live providers, got %+v", providers)
 	}
 }
 
