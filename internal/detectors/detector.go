@@ -367,12 +367,6 @@ func eligibleForAutomaticList(info types.ModelInfo, model string) bool {
 			return false
 		}
 	}
-	switch strings.ToLower(strings.TrimSpace(info.Source)) {
-	case "native", "configured":
-		if info.VerifiedAt.IsZero() && strings.TrimSpace(info.HealthStatus) == "" && info.CooldownUntil.IsZero() {
-			return false
-		}
-	}
 	return true
 }
 

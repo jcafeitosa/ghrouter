@@ -305,10 +305,10 @@ func TestBuildAutomaticModelListsUsesEligibilityAndCanonicalIDs(t *testing.T) {
 	for _, list := range lists {
 		got[list.Name] = list.Models
 	}
-	if !reflect.DeepEqual(got["ghrouter/opencode"], []string{"oc/healthy", "oc/expired", "oc/native-ready", "oc/vision"}) {
+	if !reflect.DeepEqual(got["ghrouter/opencode"], []string{"oc/healthy", "oc/expired", "oc/native-ready", "oc/native-unknown", "oc/configured", "oc/vision"}) {
 		t.Fatalf("unexpected provider list: %#v", got["ghrouter/opencode"])
 	}
-	if !reflect.DeepEqual(got["ghrouter/auto"], []string{"oc/healthy", "oc/expired", "oc/native-ready", "oc/vision"}) {
+	if !reflect.DeepEqual(got["ghrouter/auto"], []string{"oc/healthy", "oc/expired", "oc/native-ready", "oc/native-unknown", "oc/configured", "oc/vision"}) {
 		t.Fatalf("unexpected automatic list: %#v", got["ghrouter/auto"])
 	}
 	if !reflect.DeepEqual(got["ghrouter/context-1m"], []string{"oc/healthy"}) {

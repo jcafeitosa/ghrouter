@@ -43,12 +43,13 @@ func TestHandleModelsUsesCanonicalIDsAndSkipsCooldown(t *testing.T) {
 	var payload struct {
 		Object string `json:"object"`
 		Data   []struct {
-			ID      string   `json:"id"`
-			Object  string   `json:"object"`
-			Created int64    `json:"created"`
-			OwnedBy string   `json:"owned_by"`
-			List    bool     `json:"list"`
-			Members []string `json:"members"`
+			ID         string   `json:"id"`
+			Object     string   `json:"object"`
+			Created    int64    `json:"created"`
+			OwnedBy    string   `json:"owned_by"`
+			Provenance string   `json:"provenance"`
+			List       bool     `json:"list"`
+			Members    []string `json:"members"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
@@ -62,6 +63,9 @@ func TestHandleModelsUsesCanonicalIDsAndSkipsCooldown(t *testing.T) {
 	for _, entry := range payload.Data {
 		if entry.Object != "model" {
 			t.Fatalf("expected model object, got %+v", entry)
+		}
+		if entry.ID == "cx/gpt-5" && entry.Provenance != "configured" {
+			t.Fatalf("expected configured provenance for catalog model, got %+v", entry)
 		}
 		if entry.List {
 			lists[entry.ID] = append([]string(nil), entry.Members...)
@@ -175,5 +179,20 @@ func TestLiveSnapshotJSONIncludesAccountStatus(t *testing.T) {
 	}
 	if !strings.Contains(string(payload), `"account"`) {
 		t.Fatalf("expected account field in live snapshot JSON, got %s", string(payload))
+	}
+}
+
+func TestHandleLiveRespondsOnV1Path(t *testing.T) {
+	srv := New(&types.Config{})
+	req := httptest.NewRequest(http.MethodGet, "/v1/live", nil)
+	rec := httptest.NewRecorder()
+
+	srv.handleLive(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"snapshot"`) {
+		t.Fatalf("expected live response snapshot, got %s", rec.Body.String())
 	}
 }

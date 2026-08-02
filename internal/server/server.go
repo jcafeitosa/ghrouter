@@ -73,6 +73,7 @@ type stickyRoute struct {
 type ModelSummary struct {
 	ID            string    `json:"id"`
 	OwnedBy       string    `json:"owned_by"`
+	Provenance    string    `json:"provenance,omitempty"`
 	CostTier      string    `json:"cost_tier,omitempty"`
 	Capabilities  []string  `json:"capabilities,omitempty"`
 	Slots         []string  `json:"slots,omitempty"`
@@ -134,14 +135,15 @@ type ComboSummary struct {
 }
 
 type ProviderSnapshot struct {
-	Name      string         `json:"name"`
-	Type      string         `json:"type"`
-	CLIPath   string         `json:"cli_path"`
-	Models    []string       `json:"models"`
-	Available bool           `json:"available"`
-	Health    string         `json:"health"`
-	Auth      string         `json:"auth"`
-	Account   account.Status `json:"account"`
+	Name      string               `json:"name"`
+	Type      string               `json:"type"`
+	CLIPath   string               `json:"cli_path"`
+	Models    []string             `json:"models"`
+	Available bool                 `json:"available"`
+	Health    string               `json:"health"`
+	Auth      string               `json:"auth"`
+	Account   account.Status       `json:"account"`
+	Discovery types.DiscoveryState `json:"discovery,omitempty"`
 }
 
 type LiveSnapshot struct {
@@ -953,6 +955,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	mux.HandleFunc("/readyz", s.handleReadiness)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/audit", s.handleAudit)
+	mux.HandleFunc("/v1/live", s.handleLive)
 	mux.HandleFunc("/live", s.handleLive)
 	mux.HandleFunc("/", s.handleRoot)
 
@@ -2090,6 +2093,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		Object        string    `json:"object"`
 		Created       int64     `json:"created"`
 		OwnedBy       string    `json:"owned_by"`
+		Provenance    string    `json:"provenance,omitempty"`
 		Health        string    `json:"health"`
 		CooldownUntil time.Time `json:"cooldown_until,omitempty"`
 		ContextWindow int       `json:"context_window,omitempty"`
@@ -2108,12 +2112,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if !s.modelRoutable(m.Provider, m.Model) {
 			continue
 		}
-		data = append(data, modelEntry{ID: canonicalModelID(m.Provider, m.Model), Object: "model", Created: s.started.Unix(), OwnedBy: m.Provider, Health: string(m.HealthStatus), CooldownUntil: m.CooldownUntil, ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput, TokenCost: m.TokenCost, Thinking: m.Thinking, Vision: m.Vision, ToolUse: m.ToolUse, Effort: append([]string(nil), m.Effort...), CatalogSource: m.CatalogSource})
+		data = append(data, modelEntry{ID: canonicalModelID(m.Provider, m.Model), Object: "model", Created: s.started.Unix(), OwnedBy: m.Provider, Provenance: string(m.Info.Provenance()), Health: string(m.HealthStatus), CooldownUntil: m.CooldownUntil, ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput, TokenCost: m.TokenCost, Thinking: m.Thinking, Vision: m.Vision, ToolUse: m.ToolUse, Effort: append([]string(nil), m.Effort...), CatalogSource: m.CatalogSource})
 	}
 	for _, list := range s.allModelLists() {
 		members := s.functionalModelListMembers(list)
 		if len(members) > 0 {
-			data = append(data, modelEntry{ID: list.Name, Object: "model", Created: s.started.Unix(), OwnedBy: "ghrouter", CatalogSource: "generated", List: true, Members: members})
+			data = append(data, modelEntry{ID: list.Name, Object: "model", Created: s.started.Unix(), OwnedBy: "ghrouter", Provenance: string(types.ModelProvenanceConfigured), CatalogSource: "generated", List: true, Members: members})
 		}
 	}
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
@@ -2126,6 +2130,7 @@ func (s *Server) ModelSummaries() []ModelSummary {
 		out = append(out, ModelSummary{
 			ID:            canonicalModelID(m.Provider, m.Model),
 			OwnedBy:       m.Provider,
+			Provenance:    string(m.Info.Provenance()),
 			CostTier:      string(m.CostTier),
 			Capabilities:  stringifyCaps(m.Capabilities),
 			Slots:         stringifySlots(m.VirtualSlots),
@@ -2146,7 +2151,7 @@ func (s *Server) ModelSummaries() []ModelSummary {
 	for _, list := range s.allModelLists() {
 		members := s.functionalModelListMembers(list)
 		if len(members) > 0 {
-			out = append(out, ModelSummary{ID: list.Name, OwnedBy: "ghrouter", Health: "virtual", CatalogSource: "generated", List: true, Members: members})
+			out = append(out, ModelSummary{ID: list.Name, OwnedBy: "ghrouter", Provenance: string(types.ModelProvenanceConfigured), Health: "virtual", CatalogSource: "generated", List: true, Members: members})
 		}
 	}
 	return out
@@ -2324,6 +2329,7 @@ func (s *Server) LiveSnapshot() LiveSnapshot {
 			Health:    healthState,
 			Auth:      authState,
 			Account:   accountState,
+			Discovery: p.Discovery,
 		})
 	}
 	return summary
@@ -2506,6 +2512,7 @@ func (s *Server) slotSummaries() map[string]ModelSummary {
 			out[string(slot)] = ModelSummary{
 				ID:            canonicalModelID(m.Provider, m.Model),
 				OwnedBy:       m.Provider,
+				Provenance:    string(m.Info.Provenance()),
 				CostTier:      string(m.CostTier),
 				Capabilities:  stringifyCaps(m.Capabilities),
 				Slots:         stringifySlots(m.VirtualSlots),
@@ -2729,12 +2736,13 @@ func buildCatalogModels(p *types.Provider) []*catalog.ModelEntry {
 	weight := account.Weight(accountState)
 	for _, model := range p.Models {
 		metadata := p.ModelInfo[model]
+		metadata.Provider = p.Name
+		metadata.Model = model
+		if strings.TrimSpace(metadata.Source) == "" {
+			metadata.Source = "configured"
+		}
 		status := health.HealthHealthy
 		verifiedAt := metadata.VerifiedAt
-		source := strings.ToLower(strings.TrimSpace(metadata.Source))
-		if (source == "native" || source == "configured") && verifiedAt.IsZero() && metadata.HealthStatus == "" {
-			status = health.HealthUnknown
-		}
 		if metadata.HealthStatus != "" {
 			status = health.HealthStatus(metadata.HealthStatus)
 			if metadata.HealthStatus == "failed" && !metadata.CooldownUntil.IsZero() {
@@ -2769,6 +2777,7 @@ func buildCatalogModels(p *types.Provider) []*catalog.ModelEntry {
 			ToolUse:         metadata.ToolUse,
 			Effort:          append([]string(nil), metadata.Effort...),
 			CatalogSource:   metadata.Source,
+			Info:            metadata,
 			CooldownUntil:   metadata.CooldownUntil,
 			LastHealthCheck: verifiedAt,
 			ProviderWeight:  weight,

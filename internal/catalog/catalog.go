@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"ghrouter/internal/health"
+	"ghrouter/internal/types"
 )
 
 // CapabilityTag represents a model capability
@@ -52,6 +53,7 @@ type ModelEntry struct {
 	ID              string
 	Provider        string
 	Model           string
+	Info            types.ModelInfo
 	Capabilities    []CapabilityTag
 	CostTier        CostTier
 	VirtualSlots    []VirtualSlot
@@ -452,6 +454,7 @@ func (c *Catalog) RestoreModelMetadata(modelID, source string, capabilities []st
 		return
 	}
 	m.CatalogSource = source
+	m.Info.Source = source
 	m.Capabilities = make([]CapabilityTag, 0, len(capabilities))
 	for _, capability := range capabilities {
 		m.Capabilities = append(m.Capabilities, CapabilityTag(capability))

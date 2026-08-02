@@ -11,6 +11,7 @@ type Config struct {
 	Providers    []*Provider        `yaml:"providers"`
 	Routes       []*Route           `yaml:"routes"`
 	ModelLists   []ModelList        `yaml:"model_lists" json:"model_lists,omitempty"`
+	ModelPolicy  ModelPolicy        `yaml:"model_policy,omitempty" json:"model_policy,omitempty"`
 	Connections  []Connection       `yaml:"connections,omitempty" json:"connections,omitempty"`
 	Pools        []Pool             `yaml:"pools,omitempty" json:"pools,omitempty"`
 	Combos       []Combo            `yaml:"combos,omitempty" json:"combos,omitempty"`
@@ -23,13 +24,6 @@ type Config struct {
 	Server       ServerConfig       `yaml:"server,omitempty" json:"server,omitempty"`
 	Verification VerificationConfig `yaml:"verification,omitempty" json:"verification,omitempty"`
 	LocalBrain   LocalBrainConfig   `yaml:"local_brain,omitempty" json:"local_brain,omitempty"`
-}
-
-type ModelList struct {
-	Name     string   `yaml:"name" json:"name"`
-	Kind     string   `yaml:"kind,omitempty" json:"kind,omitempty"`
-	Models   []string `yaml:"models" json:"models"`
-	Strategy string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 }
 
 type Connection struct {
@@ -163,42 +157,6 @@ type Provider struct {
 	Account          ProviderAccount      `yaml:"account"`
 	Enabled          bool                 `yaml:"enabled"`
 	Discovery        DiscoveryState       `yaml:"discovery,omitempty" json:"discovery,omitempty"`
-}
-
-type DiscoveryStatus string
-
-const (
-	DiscoveryUnknown     DiscoveryStatus = "unknown"
-	DiscoverySuccess     DiscoveryStatus = "success"
-	DiscoveryEmpty       DiscoveryStatus = "empty"
-	DiscoveryTimeout     DiscoveryStatus = "timeout"
-	DiscoveryAuth        DiscoveryStatus = "auth"
-	DiscoveryError       DiscoveryStatus = "error"
-	DiscoveryUnsupported DiscoveryStatus = "unsupported"
-)
-
-type DiscoveryState struct {
-	Status       DiscoveryStatus `yaml:"status" json:"status"`
-	Error        string          `yaml:"error,omitempty" json:"error,omitempty"`
-	DiscoveredAt time.Time       `yaml:"discovered_at,omitempty" json:"discovered_at,omitempty"`
-}
-
-type ModelInfo struct {
-	Provider          string    `json:"provider,omitempty" yaml:"provider,omitempty"`
-	Model             string    `json:"model,omitempty" yaml:"model,omitempty"`
-	TokenCost         int       `json:"token_cost,omitempty" yaml:"token_cost,omitempty"`
-	ContextWindow     int       `json:"context_window,omitempty" yaml:"context_window,omitempty"`
-	MaxOutput         int       `json:"max_output,omitempty" yaml:"max_output,omitempty"`
-	Thinking          bool      `json:"thinking,omitempty" yaml:"thinking,omitempty"`
-	Vision            bool      `json:"vision,omitempty" yaml:"vision,omitempty"`
-	ToolUse           bool      `json:"tool_use,omitempty" yaml:"tool_use,omitempty"`
-	Effort            []string  `json:"effort,omitempty" yaml:"effort,omitempty"`
-	Source            string    `json:"source,omitempty" yaml:"source,omitempty"`
-	DiscoveredAt      time.Time `json:"discovered_at,omitempty" yaml:"discovered_at,omitempty"`
-	HealthStatus      string    `json:"health_status,omitempty" yaml:"health_status,omitempty"`
-	CooldownUntil     time.Time `json:"cooldown_until,omitempty" yaml:"cooldown_until,omitempty"`
-	VerifiedAt        time.Time `json:"verified_at,omitempty" yaml:"verified_at,omitempty"`
-	VerificationError string    `json:"verification_error,omitempty" yaml:"verification_error,omitempty"`
 }
 
 // ProviderType identifies the provider kind
