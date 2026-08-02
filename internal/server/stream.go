@@ -48,7 +48,7 @@ func (s *Server) nonStreamChat(ctx context.Context, w http.ResponseWriter, runne
 		ID: fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), Object: "chat.completion",
 		Created: time.Now().Unix(), Model: model,
 		Choices: []types.OpenAIChoice{{Index: 0, Message: types.OpenAIMessage{Role: "assistant", Content: text}, FinishReason: "stop"}},
-		Usage:   types.OpenAIUsage{PromptTokens: 0, CompletionTokens: estimateTokens(text), TotalTokens: estimateTokens(text)},
+		Usage:   types.OpenAIUsage{PromptTokens: estimatePromptTokens(req), CompletionTokens: estimateTokens(text), TotalTokens: estimatePromptTokens(req) + estimateTokens(text)},
 	}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -117,3 +117,28 @@ func (s *Server) writeChunk(flusher http.Flusher, chatID, model string, choice t
 }
 
 func estimateTokens(text string) int { return (len(text) + 3) / 4 }
+
+func estimatePromptTokens(req *types.OpenAIRequest) int {
+	if req == nil {
+		return 0
+	}
+	total := 0
+	for _, msg := range req.Messages {
+		switch content := msg.Content.(type) {
+		case string:
+			total += estimateTokens(content)
+		case []interface{}:
+			for _, part := range content {
+				if m, ok := part.(map[string]interface{}); ok {
+					if text, ok := m["text"].(string); ok {
+						total += estimateTokens(text)
+					}
+				}
+			}
+		}
+	}
+	if req.Model != "" {
+		total += estimateTokens(req.Model)
+	}
+	return total
+}

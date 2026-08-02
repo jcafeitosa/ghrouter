@@ -1,6 +1,9 @@
 package types
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Config is the root configuration for the router
 type Config struct {
@@ -22,6 +25,7 @@ type Provider struct {
 	WorkDir    string            `yaml:"work_dir"`
 	AuthMethod AuthMethod        `yaml:"auth_method"`
 	AuthConfig map[string]string `yaml:"auth_config"`
+	Account    ProviderAccount   `yaml:"account"`
 	Enabled    bool              `yaml:"enabled"`
 }
 
@@ -34,6 +38,7 @@ const (
 	ProviderOpenCode   ProviderType = "opencode"
 	ProviderMimo       ProviderType = "mimo"
 	ProviderPi         ProviderType = "pi"
+	ProviderCursor     ProviderType = "cursor"
 	ProviderOpenAI     ProviderType = "openai"
 	ProviderAnthropic  ProviderType = "anthropic"
 	ProviderAzure      ProviderType = "azure"
@@ -56,6 +61,37 @@ type Route struct {
 	Pattern  string   `yaml:"pattern"`
 	Provider string   `yaml:"provider"`
 	Fallback []string `yaml:"fallback"`
+}
+
+type ProviderAccount struct {
+	Plan      string   `json:"plan,omitempty" yaml:"plan,omitempty"`
+	Balance   *float64 `json:"balance,omitempty" yaml:"balance,omitempty"`
+	Currency  string   `json:"currency,omitempty" yaml:"currency,omitempty"`
+	ResetAt   string   `json:"reset_at,omitempty" yaml:"reset_at,omitempty"`
+	Source    string   `json:"source,omitempty" yaml:"source,omitempty"`
+	Available bool     `json:"available" yaml:"available"`
+}
+
+func (a ProviderAccount) String() string {
+	balance := ""
+	if a.Balance != nil {
+		balance = fmt.Sprintf("%.2f", *a.Balance)
+	}
+	parts := []string{a.Plan, balance, a.Currency, a.Source}
+	out := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		if out != "" {
+			out += " "
+		}
+		out += part
+	}
+	if out == "" {
+		return "unavailable"
+	}
+	return out
 }
 
 // OpenAIRequest is the incoming request from gh copilot (OpenAI Chat Completions format)

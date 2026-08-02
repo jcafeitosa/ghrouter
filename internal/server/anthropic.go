@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"ghrouter/internal/providers"
@@ -60,10 +61,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	end := s.telemetry.begin()
+	start := time.Now()
 
 	var req AnthropicRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, 400, "invalid_request", err.Error())
+		end("error", false, "", req.Model, "/v1/messages", time.Since(start))
 		return
 	}
 
@@ -71,26 +75,31 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	internalReq := s.convertToInternalRequest(&req)
 
 	// Determine provider and model
-	provider, model := s.route(internalReq.Model)
+	provider, model := s.RouteOpenAIRequest(internalReq)
 	if provider == "" {
 		writeError(w, 404, "model_not_found", fmt.Sprintf("no provider for model %q", internalReq.Model))
+		end("error", false, "", req.Model, "/v1/messages", time.Since(start))
 		return
 	}
+	fallback := req.Model != "" && !strings.EqualFold(req.Model, model)
 
 	runner := s.getProvider(provider)
 	if runner == nil {
 		writeError(w, 500, "provider_unavailable", fmt.Sprintf("provider %s not started", provider))
+		end("error", fallback, provider, model, "/v1/messages", time.Since(start))
 		return
 	}
 
 	// Handle streaming
 	if req.Stream {
 		s.streamAnthropic(r.Context(), w, runner, &req, model)
+		end("ok", fallback, provider, model, "/v1/messages", time.Since(start))
 		return
 	}
 
 	// Non-streaming
 	s.nonStreamAnthropic(r.Context(), w, runner, &req, model)
+	end("ok", fallback, provider, model, "/v1/messages", time.Since(start))
 }
 
 // convertToInternalRequest converts AnthropicRequest to our internal OpenAIRequest
@@ -160,7 +169,7 @@ func (s *Server) nonStreamAnthropic(ctx context.Context, w http.ResponseWriter, 
 		Model:      req.Model,
 		StopReason: "end_turn",
 		Usage: AnthropicUsage{
-			InputTokens:  0, // TODO: implement token counting
+			InputTokens:  estimateAnthropicPromptTokens(internalReq),
 			OutputTokens: estimateTokens(text),
 		},
 	}
@@ -245,4 +254,8 @@ func (s *Server) writeAnthropicEvent(w http.ResponseWriter, flusher http.Flusher
 	data, _ := json.Marshal(event)
 	fmt.Fprintf(w, "event: message_delta\ndata: %s\n\n", data)
 	flusher.Flush()
+}
+
+func estimateAnthropicPromptTokens(req *types.OpenAIRequest) int {
+	return estimatePromptTokens(req)
 }

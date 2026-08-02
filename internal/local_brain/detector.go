@@ -30,6 +30,17 @@ func (d *Detector) Detect() (BackendType, error) {
 	return BackendNone, nil
 }
 
+func (d *Detector) IsBackendAvailable(backend BackendType) bool {
+	switch backend {
+	case BackendMLX:
+		return d.isMLXAvailable()
+	case BackendLLAMACPP:
+		return d.isLlamaCppAvailable()
+	default:
+		return false
+	}
+}
+
 func (d *Detector) isMLXAvailable() bool {
 	cmd := exec.Command("python3", "-c", "import mlx; print('ok')")
 	if out, err := cmd.CombinedOutput(); err == nil && strings.Contains(string(out), "ok") {
@@ -76,6 +87,29 @@ func NewModelManager() (*ModelManager, error) {
 	return &ModelManager{cacheDir: cacheDir}, nil
 }
 
+func (m *ModelManager) Prepare() error {
+	if m == nil {
+		return fmt.Errorf("model manager not configured")
+	}
+	for _, dir := range []string{
+		m.cacheDir,
+		filepath.Join(m.cacheDir, "mlx"),
+		filepath.Join(m.cacheDir, "llama.cpp"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *ModelManager) CacheDir() string {
+	if m == nil {
+		return ""
+	}
+	return m.cacheDir
+}
+
 func (m *ModelManager) EnsureModelAvailable(backend BackendType, modelID string) (string, error) {
 	switch backend {
 	case BackendMLX:
@@ -92,8 +126,7 @@ func (m *ModelManager) ensureMLXModel(modelID string) (string, error) {
 	if _, err := os.Stat(modelDir); err == nil {
 		return modelDir, nil
 	}
-	// MLX models loaded via HF snapshot at runtime via python
-	return "", nil
+	return "", fmt.Errorf("mlx model %q not found in cache", modelID)
 }
 
 func (m *ModelManager) ensureLlamaCppModel(modelID string) (string, error) {
@@ -101,5 +134,18 @@ func (m *ModelManager) ensureLlamaCppModel(modelID string) (string, error) {
 	if _, err := os.Stat(modelPath); err == nil {
 		return modelPath, nil
 	}
-	return "", nil
+	return "", fmt.Errorf("llama.cpp model %q not found in cache", modelID)
+}
+
+func (m *ModelManager) HasModel(backend BackendType, modelID string) bool {
+	switch backend {
+	case BackendMLX:
+		_, err := os.Stat(filepath.Join(m.cacheDir, "mlx", modelID))
+		return err == nil
+	case BackendLLAMACPP:
+		_, err := os.Stat(filepath.Join(m.cacheDir, modelID+".gguf"))
+		return err == nil
+	default:
+		return false
+	}
 }

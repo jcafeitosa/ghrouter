@@ -27,6 +27,10 @@ type Loop struct {
 	onChange       func(provider string, old, new HealthStatus)
 }
 
+type Snapshot struct {
+	Providers map[string]HealthCheckResult
+}
+
 // NewLoop returns a new health check loop with the given interval and timeout.
 func NewLoop(interval, timeout time.Duration) *Loop {
 	return &Loop{
@@ -152,4 +156,17 @@ func (l *Loop) GetHealth(provider string) *HealthCheckResult {
 	}
 	copy := *result
 	return &copy
+}
+
+func (l *Loop) Snapshot() Snapshot {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	out := make(map[string]HealthCheckResult, len(l.results))
+	for name, result := range l.results {
+		if result == nil {
+			continue
+		}
+		out[name] = *result
+	}
+	return Snapshot{Providers: out}
 }

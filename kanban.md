@@ -69,13 +69,13 @@
 | 4.5 | `ghrouter models` — catalog with health/cooldown/capability/tags, filter/sort | ⏳ Planned | Dev | |
 | 4.6 | `ghrouter routes` — show routing table + resolved targets, dry-run mode | ⏳ Planned | Dev | |
 | 4.7 | `ghrouter test <model>` — smoke test with latency report, `--stream` flag | ⏳ Planned | Dev | |
-| 4.8 | `ghrouter live` — TUI monitor (real-time health, requests, cooldowns, fallback events) | ⏳ Planted | Dev | Bubble Tea |
-| 4.9 | `ghrouter ping` — quick connectivity check | ⏳ Planted | Dev | |
-| 4.10 | `ghrouter explain <model>` — shows routing decision, provider, fallback chain | ⏳ Planted | Dev | |
-| 4.11 | `ghrouter serve` — run as daemon with PID file, log rotation | ⏳ Planted | Dev | |
-| 4.12 | `ghrouter sync` — re-scan CLIs/models, update catalog | ⏳ Planted | Dev | |
+| 4.8 | `ghrouter live` — TUI monitor (real-time health, requests, cooldowns, fallback events) | ✅ Partial | Dev | Bubble Tea |
+| 4.9 | `ghrouter ping` — quick connectivity check | ✅ Partial | Dev | |
+| 4.10 | `ghrouter explain <model>` — shows routing decision, provider, fallback chain | ✅ Partial | Dev | |
+| 4.11 | `ghrouter serve` — run as daemon with PID file, log rotation | ✅ Partial | Dev | |
+| 4.12 | `ghrouter sync` — re-scan CLIs/models, update catalog | ✅ Partial | Dev | |
 | 4.13 | Config hot-reload (SIGHUP) — zero-downtime | ⏳ Planted | Dev | File watcher |
-| 4.14 | `ghrouter version` / `--version` / `-v` — git describe | ⏳ Planted | Dev | |
+| 4.14 | `ghrouter version` / `--version` / `-v` — git describe | ✅ Partial | Dev | |
 
 ---
 
@@ -99,11 +99,11 @@
 ### EPIC 6: Real-Time Monitoring & TUI 📦 **PLANNED**
 | ID | Task | Status | Owner | Notes |
 |----|------|--------|-------|-------|
-| 6.1 | `ghrouter live` — TUI monitor (real-time health, requests, cooldowns, fallback events) | ⏳ Planted | Dev | Bubble Tea |
-| 6.2 | JSON/stream mode for automation — `ghrouter live --json` | ⏳ Planted | Dev | |
+| 6.1 | `ghrouter live` — TUI monitor (real-time health, requests, cooldowns, fallback events) | ✅ Partial | Dev | Bubble Tea |
+| 6.2 | JSON/stream mode for automation — `ghrouter live --json` | ✅ Partial | Dev | |
 | 6.3 | Structured logs with request-id correlation | ⏳ Planted | Dev | |
-| 6.4 | Request history — in-memory ring buffer + optional persistence | ⏳ Planted | Dev | |
-| 6.5 | Token/cost/time metrics per request + aggregated | ⏳ Planted | Dev | |
+| 6.4 | Request history — in-memory ring buffer + optional persistence | ✅ Partial | Dev | |
+| 6.5 | Token/cost/time metrics per request + aggregated | ✅ Partial | Dev | |
 
 ---
 

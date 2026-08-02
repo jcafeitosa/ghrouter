@@ -7,14 +7,13 @@
 
 ![ghrouter cover](assets/ghrouter-cover.png)
 
-> **Local AI router for GitHub Copilot CLI** — Auto-discovers local provider CLIs, prepares the local runtime, exposes OpenAI- and Anthropic-compatible endpoints, and routes requests through a single transparent gateway. Zero-config first run, with silent startup checks.
+> **Local AI router for GitHub Copilot CLI** — Auto-discovers local provider CLIs, validates the local runtime, exposes OpenAI- and Anthropic-compatible endpoints, and routes requests through a single transparent gateway. Zero-config first run, with silent startup checks and a live terminal dashboard.
 
 ## Target Runtime
 
 - Detects the machine environment at startup.
 - Checks whether MLX or llama.cpp is available.
-- Falls back to local setup routines when a backend is missing.
-- Boots a compatible model pipeline for the active backend.
+- Verifies that supported backends and models are present before serving traffic.
 - Exposes one router endpoint for `gh copilot` and other clients.
 - Keeps routing, health, and model catalog logic behind a single HTTP surface.
 
@@ -29,12 +28,10 @@ flowchart LR
     I --> D{Backend available?}
     D -->|MLX| M1[MLX runtime]
     D -->|llama.cpp| M2[llama.cpp runtime]
-    D -->|none| A[Silent install + config]
-    A --> M1
-    A --> M2
-    M1 --> L[Load / download model]
-    M2 --> L
-    L --> R[Route request to provider]
+    D -->|none| A[Silent preflight failure]
+    A --> X[Stop with checklist]
+    M1 --> R[Route request to provider]
+    M2 --> R
     R --> P[Provider CLI runner]
     P --> O[Streaming or non-streaming response]
     S --> E[/v1/chat/completions /v1/messages /v1/models /health/]
@@ -54,8 +51,8 @@ sequenceDiagram
 
     Client->>Main: start ghrouter
     Main->>Brain: detect machine, backend, model readiness
-    Brain-->>Main: MLX / llama.cpp / install needed / model path
-    Main->>Server: start HTTP API
+    Brain-->>Main: MLX / llama.cpp / model readiness report
+    Main->>Server: start HTTP API if ready
     Client->>Server: POST request
     Server->>Server: route model + provider
     Server->>Provider: invoke request
@@ -71,7 +68,7 @@ sequenceDiagram
 
 - it checks the machine first,
 - makes sure the expected backend exists,
-- prepares the runtime quietly,
+- verifies the model cache and provider readiness,
 - then serves model requests through one stable API.
 
 That keeps `gh copilot` pointed at one local endpoint while the project manages provider discovery, routing, health, and model availability behind the scenes.
@@ -88,6 +85,7 @@ That keeps `gh copilot` pointed at one local endpoint while the project manages 
   - `opencode` — [OpenCode](https://github.com/sst/opencode) (`opencode auth login`)
   - `mimo` — [Mimo](https://github.com/mimocode/mimocode) (`mimo auth login`)
   - `pi` — [Pi](https://github.com/pi/pi) (`pi auth`)
+  - `cursor` — [Cursor CLI](https://cursor.com/docs/cli/overview) (`CURSOR_API_KEY` / `agent login`)
 
 ### Install
 
@@ -98,14 +96,17 @@ cd ghrouter
 go build -o ghrouter
 
 # Or install pre-built binary (releases)
-# TBD
+# Use the GitHub Releases page when pre-built artifacts are published.
 ```
 
 ### Run
 
 ```bash
-# Zero-config: auto-discovers installed CLIs
+# Zero-config: opens the interactive router dashboard and auto-discovers installed CLIs
 ./ghrouter
+
+# Headless server mode
+./ghrouter serve
 
 # With custom config
 GHR_CONFIG=./config.yaml ./ghrouter
@@ -136,8 +137,9 @@ gh copilot "explain this code"
 | **opencode** | `opencode run --format json --no-remote` | `opencode auth login` | Provider-defined |
 | **mimo** | `mimo run --format json --pure` | `mimo auth login` | Provider-defined |
 | **pi** | `pi --mode json --print --no-session --no-context-files` | `pi auth` / `GOOGLE_API_KEY` | `anthropic/claude-sonnet-5`, `openai/gpt-5` |
+| **cursor** | `agent -p --output-format stream-json --stream-partial-output --model <id>` | `CURSOR_API_KEY` / `agent login` | `composer-2`, `composer2-fast` |
 
-Models are auto-prefixed: `cc/`, `cx/`, `oc/`, `mi/`, `pi/`.
+Models are auto-prefixed: `cc/`, `cx/`, `oc/`, `mi/`, `pi/`, `cu/`.
 
 ---
 
@@ -299,11 +301,14 @@ ghrouter                    # Start server (auto-detects CLIs)
 ghrouter --config path.yaml # Use custom config
 ghrouter init               # Interactive wizard (creates config.yaml)
 ghrouter doctor             # Validate CLIs, auth, models, connectivity
+ghrouter bootstrap          # Sync config and validate startup prerequisites
+ghrouter export             # Export config + runtime snapshot bundle
+ghrouter import <bundle>    # Restore config from a bundle
 ghrouter config             # View/edit current config
 ghrouter providers          # List detected providers and models
 ghrouter models             # List catalog with health/cooldown status
 ghrouter routes             # Show routing table
-ghrouter live               # Real-time TUI monitor
+ghrouter live               # Real-time router dashboard and snapshot
 ghrouter test <model>       # Quick smoke test against a model
 ghrouter version            # Show version
 ```
@@ -374,7 +379,7 @@ go test -race ./...
 # Build
 go build -o ghrouter
 
-# Run with live config reload (SIGHUP)
+# Run the server
 ./ghrouter
 ```
 

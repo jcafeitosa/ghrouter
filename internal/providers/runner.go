@@ -96,7 +96,11 @@ func (r *ProviderRunner) executeCLI(ctx context.Context, req *types.OpenAIReques
 		model = strings.TrimPrefix(model, "oc/")
 		model = strings.TrimPrefix(model, "mi/")
 		model = strings.TrimPrefix(model, "pi/")
-		args = append(args, "-m", model)
+		modelFlag := "-m"
+		if r.prov != nil && r.prov.Type == types.ProviderCursor {
+			modelFlag = "--model"
+		}
+		args = append(args, modelFlag, model)
 	}
 
 	cmd := exec.CommandContext(ctx, r.prov.CLIPath, args...)
@@ -168,14 +172,11 @@ func (r *ProviderRunner) buildPrompt(req *types.OpenAIRequest) string {
 }
 
 func (r *ProviderRunner) buildEnv() []string {
-	env := []string{}
+	env := make([]string, 0, len(r.prov.Env)+len(os.Environ()))
 	for k, v := range r.prov.Env {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
-	// Add current environment
-	for _, e := range os.Environ() {
-		env = append(env, e)
-	}
+	env = append(env, os.Environ()...)
 	return env
 }
 
@@ -244,7 +245,19 @@ func (r *ProviderRunner) GetHealth() *ProviderHealth {
 	}
 }
 
+func (r *ProviderRunner) GetName() string {
+	return r.prov.Name
+}
+
+func (r *ProviderRunner) GetModels() []string {
+	return append([]string(nil), r.prov.Models...)
+}
+
 func (r *ProviderRunner) HealthCheck(ctx context.Context) error {
+	if len(r.prov.Models) == 0 {
+		return fmt.Errorf("provider %s has no configured models", r.prov.Name)
+	}
+
 	// Quick test request
 	testReq := &types.OpenAIRequest{
 		Model: r.prov.Models[0],

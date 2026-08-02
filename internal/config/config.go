@@ -35,3 +35,11 @@ func ResolveConfigPath(raw string) string {
 	}
 	return raw
 }
+
+func Save(path string, cfg *types.Config) error {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}

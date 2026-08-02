@@ -28,6 +28,8 @@ func (d *Detector) DetectAll() ([]*types.Provider, error) {
 		{Name: "opencode", ProviderType: types.ProviderOpenCode, Args: []string{"run", "--format", "json", "--no-remote"}, Aliases: []string{}, Env: map[string]string{}},
 		{Name: "mimo", ProviderType: types.ProviderMimo, Args: []string{"run", "--format", "json", "--pure"}, Aliases: []string{}, Env: map[string]string{}},
 		{Name: "pi", ProviderType: types.ProviderPi, Args: []string{"--mode", "json", "--print", "--no-session", "--no-context-files"}, Aliases: []string{"anthropic/claude-sonnet-5", "openai/gpt-5"}, Env: map[string]string{}},
+		{Name: "agent", ProviderType: types.ProviderCursor, Args: []string{"-p", "--output-format", "stream-json", "--stream-partial-output"}, Aliases: []string{"composer-2", "composer2-fast"}, Env: map[string]string{}},
+		{Name: "cursor", ProviderType: types.ProviderCursor, Args: []string{"-p", "--output-format", "stream-json", "--stream-partial-output"}, Aliases: []string{"composer-2", "composer2-fast"}, Env: map[string]string{}},
 	}
 	providers := make([]*types.Provider, 0, len(specs))
 	for _, spec := range specs {
@@ -47,7 +49,7 @@ func (d *Detector) buildProvider(spec CLISpec, path string) *types.Provider {
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	for _, key := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_API_BASE", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_HOME", "OPENCODE_HOME", "PI_HOME"} {
+	for _, key := range []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_API_BASE", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_HOME", "OPENCODE_HOME", "PI_HOME", "CURSOR_API_KEY"} {
 		if value := os.Getenv(key); value != "" {
 			env[key] = value
 		}
@@ -61,7 +63,7 @@ func (d *Detector) buildProvider(spec CLISpec, path string) *types.Provider {
 }
 
 func prefix(provider types.ProviderType, model string) string {
-	p := map[types.ProviderType]string{types.ProviderClaudeCode: "cc/", types.ProviderCodex: "cx/", types.ProviderOpenCode: "oc/", types.ProviderMimo: "mi/", types.ProviderPi: "pi/"}[provider]
+	p := map[types.ProviderType]string{types.ProviderClaudeCode: "cc/", types.ProviderCodex: "cx/", types.ProviderOpenCode: "oc/", types.ProviderMimo: "mi/", types.ProviderPi: "pi/", types.ProviderCursor: "cu/"}[provider]
 	if strings.HasPrefix(model, p) {
 		return model
 	}

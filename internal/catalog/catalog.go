@@ -60,6 +60,7 @@ type ModelEntry struct {
 	CooldownUntil   time.Time
 	TokenCost       int // cost per 1k tokens in micro-units
 	MaxTokens       int
+	ProviderWeight  float64
 }
 
 // Catalog maintains a live catalog of available models
@@ -128,11 +129,9 @@ func (c *Catalog) RegisterProvider(provider string, models []*ModelEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var ids []string
 	for _, m := range models {
 		id := c.modelKey(provider, m.Model)
 		c.models[id] = m
-		ids = append(ids, id)
 		c.byProvider[provider] = append(c.byProvider[provider], id)
 	}
 	c.rebuildSlots()
@@ -176,6 +175,45 @@ func (c *Catalog) GetModelBySlot(slot VirtualSlot) *ModelEntry {
 		}
 	}
 	return nil
+}
+
+func (c *Catalog) BestHealthyModel() *ModelEntry {
+	return c.bestHealthyModelForSlot(SlotAuto)
+}
+
+func (c *Catalog) BestHealthyModelForSlot(slot VirtualSlot) *ModelEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.bestHealthyModelForSlotLocked(slot)
+}
+
+func (c *Catalog) bestHealthyModelForSlot(slot VirtualSlot) *ModelEntry {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.bestHealthyModelForSlotLocked(slot)
+}
+
+func (c *Catalog) bestHealthyModelForSlotLocked(slot VirtualSlot) *ModelEntry {
+	var best *ModelEntry
+	bestScore := -1.0
+	for _, m := range c.models {
+		if m.HealthStatus != health.HealthHealthy {
+			continue
+		}
+		if c.isInCooldownLocked(c.modelKey(m.Provider, m.Model)) {
+			continue
+		}
+		score := c.scoreForSlot(m, slot)
+		if score > bestScore {
+			bestScore = score
+			best = m
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	copy := *best
+	return &copy
 }
 
 func (c *Catalog) GetModelsByProvider(provider string) []*ModelEntry {
@@ -354,6 +392,10 @@ func (c *Catalog) scoreForSlot(m *ModelEntry, slot VirtualSlot) float64 {
 
 	// Error rate penalty
 	score -= m.ErrorRate * 100
+
+	if m.ProviderWeight > 0 {
+		score *= m.ProviderWeight
+	}
 
 	return score
 }
