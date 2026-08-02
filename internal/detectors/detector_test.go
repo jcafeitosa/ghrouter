@@ -3,46 +3,365 @@ package detectors
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 
 	"ghrouter/internal/types"
 )
 
-func TestDetectAllIncludesCursorAgent(t *testing.T) {
+func TestDetectAllUsesNativeHelpAndDiscovery(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("executable test shim not wired for windows in this repo")
+		t.Skip("shell test shims are not wired for windows in this repo")
 	}
 	tmpDir := t.TempDir()
-	for _, name := range []string{"agent", "cursor"} {
-		path := filepath.Join(tmpDir, name)
-		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-			t.Fatalf("seed %s binary: %v", name, err)
-		}
-	}
 	t.Setenv("PATH", tmpDir)
-	t.Setenv("CURSOR_API_KEY", "test")
+	t.Setenv("ANTHROPIC_API_KEY", "anthropic-key")
+	t.Setenv("OPENAI_API_KEY", "openai-key")
+	t.Setenv("MIMO_API_KEY", "mimo-key")
+	t.Setenv("PI_HOME", filepath.Join(tmpDir, "pi-home"))
+	t.Setenv("CURSOR_API_KEY", "cursor-key")
+
+	writeShim(t, filepath.Join(tmpDir, "claude"), `#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/claude.calls"
+if [ "$1" = "--help" ]; then
+  printf 'claude help without acp\n'
+  exit 0
+fi
+exit 0
+`)
+	writeShim(t, filepath.Join(tmpDir, "codex"), `#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/codex.calls"
+if [ "$1" = "--help" ]; then
+  printf 'codex help without acp\n'
+  exit 0
+fi
+exit 0
+`)
+	writeShim(t, filepath.Join(tmpDir, "opencode"), `#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/opencode.calls"
+if [ "$1" = "--help" ]; then
+  printf 'OpenCode native acp help\n'
+  exit 0
+fi
+if [ "$1" = "models" ]; then
+  printf 'opencode/nemotron-3-ultra-free\n'
+  printf '{\n'
+  printf '  "limit": {"context": 1000000, "output": 128000},\n'
+  printf '  "capabilities": {\n'
+  printf '    "reasoning": true,\n'
+  printf '    "toolcall": true,\n'
+  printf '    "input": {"image": false}\n'
+  printf '  },\n'
+  printf '  "variants": {\n'
+  printf '    "high": {"reasoningEffort": "high"},\n'
+  printf '    "max": {"reasoningEffort": "max"}\n'
+  printf '  }\n'
+  printf '}\n\n'
+  exit 0
+fi
+exit 1
+`)
+	writeShim(t, filepath.Join(tmpDir, "mimo"), `#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/mimo.calls"
+if [ "$1" = "--help" ]; then
+  printf 'Mimo native acp help\n'
+  exit 0
+fi
+if [ "$1" = "models" ]; then
+  printf 'mimo/test-model\n'
+  exit 0
+fi
+exit 1
+`)
+	writeShim(t, filepath.Join(tmpDir, "pi"), `#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/pi.calls"
+if [ "$1" = "--help" ]; then
+  printf 'pi native rpc help\n'
+  exit 0
+fi
+if [ "$1" = "--list-models" ]; then
+  printf 'provider        model                    context max-out thinking images\n'
+  printf 'anthropic       claude-sonnet-5          1M      64K     yes      yes\n'
+  exit 0
+fi
+exit 1
+`)
+	writeShim(t, filepath.Join(tmpDir, "cursor"), `#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/cursor.calls"
+if [ "$1" = "--help" ]; then
+  printf 'cursor native cli help\n'
+  exit 0
+fi
+if [ "$1" = "agent" ] && [ "$2" = "--list-models" ]; then
+  printf 'Available models\n'
+  printf 'composer-2.5 - Composer\n'
+  exit 0
+fi
+exit 1
+`)
 
 	providers, err := NewDetector().DetectAll()
 	if err != nil {
 		t.Fatalf("detect all: %v", err)
 	}
-	var found bool
+	got := make(map[types.ProviderType]*types.Provider, len(providers))
 	for _, provider := range providers {
 		if provider == nil {
 			continue
 		}
-		if provider.Type == types.ProviderCursor {
-			found = true
-			if provider.CLIPath != filepath.Join(tmpDir, "agent") && provider.CLIPath != filepath.Join(tmpDir, "cursor") {
-				t.Fatalf("expected cursor cli path from temp dir, got %s", provider.CLIPath)
+		got[provider.Type] = provider
+	}
+	cases := []struct {
+		provider        types.ProviderType
+		wantProtocol    string
+		wantOrigin      string
+		wantCapability  string
+		wantDiscovery   types.DiscoveryStatus
+		wantModels      []string
+		wantEnvKeys     []string
+		wantFailKeyword string
+	}{
+		{
+			provider:        types.ProviderClaudeCode,
+			wantProtocol:    "native_cli",
+			wantOrigin:      "native_cli",
+			wantCapability:  "unsupported",
+			wantDiscovery:   types.DiscoveryUnsupported,
+			wantModels:      nil,
+			wantEnvKeys:     []string{"ANTHROPIC_API_KEY", "PATH"},
+			wantFailKeyword: "native cli contract",
+		},
+		{
+			provider:        types.ProviderCodex,
+			wantProtocol:    "native_cli",
+			wantOrigin:      "native_cli",
+			wantCapability:  "unsupported",
+			wantDiscovery:   types.DiscoveryUnsupported,
+			wantModels:      nil,
+			wantEnvKeys:     []string{"OPENAI_API_KEY", "PATH"},
+			wantFailKeyword: "native cli contract",
+		},
+		{
+			provider:       types.ProviderOpenCode,
+			wantProtocol:   "acp",
+			wantOrigin:     "native_cli",
+			wantCapability: "supported",
+			wantDiscovery:  types.DiscoverySuccess,
+			wantModels:     []string{"oc/nemotron-3-ultra-free"},
+			wantEnvKeys:    []string{"OPENAI_API_KEY", "PATH"},
+		},
+		{
+			provider:       types.ProviderMimo,
+			wantProtocol:   "acp",
+			wantOrigin:     "native_cli",
+			wantCapability: "supported",
+			wantDiscovery:  types.DiscoverySuccess,
+			wantModels:     []string{"mi/test-model"},
+			wantEnvKeys:    []string{"MIMO_API_KEY", "OPENAI_API_KEY", "PATH"},
+		},
+		{
+			provider:        types.ProviderPi,
+			wantProtocol:    "native_rpc",
+			wantOrigin:      "native_rpc",
+			wantCapability:  "unsupported",
+			wantDiscovery:   types.DiscoverySuccess,
+			wantModels:      []string{"pi/anthropic/claude-sonnet-5"},
+			wantEnvKeys:     []string{"OPENAI_API_KEY", "PI_HOME", "PATH"},
+			wantFailKeyword: "native rpc contract",
+		},
+		{
+			provider:        types.ProviderCursor,
+			wantProtocol:    "native_cli",
+			wantOrigin:      "native_cli",
+			wantCapability:  "unsupported",
+			wantDiscovery:   types.DiscoverySuccess,
+			wantModels:      []string{"cu/composer-2.5"},
+			wantEnvKeys:     []string{"CURSOR_API_KEY", "PATH"},
+			wantFailKeyword: "native cli contract",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.provider), func(t *testing.T) {
+			provider := got[tc.provider]
+			if provider == nil {
+				t.Fatalf("expected provider %s to be detected", tc.provider)
 			}
-			if len(provider.Models) == 0 {
-				t.Fatalf("expected cursor models, got %+v", provider)
+			if provider.Protocol != tc.wantProtocol {
+				t.Fatalf("protocol = %q, want %q", provider.Protocol, tc.wantProtocol)
 			}
+			if provider.Origin != tc.wantOrigin {
+				t.Fatalf("origin = %q, want %q", provider.Origin, tc.wantOrigin)
+			}
+			if provider.CapabilityStatus != tc.wantCapability {
+				t.Fatalf("capability = %q, want %q", provider.CapabilityStatus, tc.wantCapability)
+			}
+			if tc.wantFailKeyword != "" && !strings.Contains(provider.FailureReason, tc.wantFailKeyword) {
+				t.Fatalf("failure reason %q missing %q", provider.FailureReason, tc.wantFailKeyword)
+			}
+			if provider.Discovery.Status != tc.wantDiscovery {
+				t.Fatalf("discovery status = %q, want %q (error=%q models=%#v)", provider.Discovery.Status, tc.wantDiscovery, provider.Discovery.Error, provider.Models)
+			}
+			if !reflect.DeepEqual(provider.Models, tc.wantModels) {
+				t.Fatalf("models = %#v, want %#v", provider.Models, tc.wantModels)
+			}
+			assertAllowedEnvKeys(t, provider.Env, tc.wantEnvKeys)
+		})
+	}
+
+	for _, name := range []string{"claude", "codex", "opencode", "mimo", "pi", "cursor"} {
+		calls, err := os.ReadFile(filepath.Join(tmpDir, name+".calls"))
+		if err != nil {
+			t.Fatalf("read %s calls: %v", name, err)
+		}
+		if !strings.Contains(string(calls), "--help") {
+			t.Fatalf("expected %s to be help-probed, got %q", name, string(calls))
 		}
 	}
-	if !found {
-		t.Fatal("expected cursor provider to be detected")
+	assertContains(t, filepath.Join(tmpDir, "opencode.calls"), "models --verbose --pure")
+	assertContains(t, filepath.Join(tmpDir, "mimo.calls"), "models")
+	assertContains(t, filepath.Join(tmpDir, "pi.calls"), "--list-models")
+	assertContains(t, filepath.Join(tmpDir, "cursor.calls"), "agent --list-models")
+}
+
+func TestDiscoveryStatusesAreTypedForUnsupportedTimeoutAndAuth(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell test shims are not wired for windows in this repo")
+	}
+	tmpDir := t.TempDir()
+
+	unsupported := discoverModelsWithTimeout(filepath.Join(tmpDir, "missing"), types.ProviderClaudeCode, time.Second)
+	if unsupported.status != string(types.DiscoveryUnsupported) {
+		t.Fatalf("unsupported status = %q, want %q", unsupported.status, types.DiscoveryUnsupported)
+	}
+
+	authShim := filepath.Join(tmpDir, "mimo")
+	writeShim(t, authShim, `#!/bin/sh
+if [ "$1" = "models" ]; then
+  printf 'auth failed\n' >&2
+  exit 1
+fi
+exit 1
+`)
+	authResult := discoverModelsWithTimeout(authShim, types.ProviderMimo, time.Second)
+	if authResult.status != string(types.DiscoveryAuth) {
+		t.Fatalf("auth status = %q, want %q", authResult.status, types.DiscoveryAuth)
+	}
+
+	timeoutShim := filepath.Join(tmpDir, "pi")
+	writeShim(t, timeoutShim, `#!/bin/sh
+if [ "$1" = "--list-models" ]; then
+  sleep 1
+  exit 0
+fi
+exit 1
+`)
+	timeoutResult := discoverModelsWithTimeout(timeoutShim, types.ProviderPi, 20*time.Millisecond)
+	if timeoutResult.status != string(types.DiscoveryTimeout) {
+		t.Fatalf("timeout status = %q, want %q", timeoutResult.status, types.DiscoveryTimeout)
+	}
+}
+
+func TestBuildAutomaticModelListsUsesEligibilityAndCanonicalIDs(t *testing.T) {
+	now := time.Now()
+	providers := []*types.Provider{{
+		Name:    "opencode",
+		Type:    types.ProviderOpenCode,
+		Enabled: true,
+		Models: []string{
+			"oc/healthy",
+			"oc/failed",
+			"oc/cooldown",
+			"oc/expired",
+			"oc/native-ready",
+			"oc/native-unknown",
+			"oc/configured",
+			"oc/vision",
+		},
+		ModelInfo: map[string]types.ModelInfo{
+			"oc/healthy":        {ContextWindow: 1_000_000, Thinking: true, ToolUse: true, Effort: []string{"max", "high"}},
+			"oc/failed":         {HealthStatus: "failed"},
+			"oc/cooldown":       {HealthStatus: "cooldown", CooldownUntil: now.Add(time.Hour)},
+			"oc/expired":        {HealthStatus: "cooldown", CooldownUntil: now.Add(-time.Hour)},
+			"oc/native-ready":   {Source: "native", HealthStatus: "healthy", VerifiedAt: now},
+			"oc/native-unknown": {Source: "native"},
+			"oc/configured":     {Source: "configured"},
+			"oc/vision":         {Vision: true},
+		},
+	}}
+	lists := BuildAutomaticModelLists(providers, []types.ModelList{
+		{Name: "ghrouter/opencode", Models: []string{"oc/stale"}},
+		{Name: "ghrouter/auto", Models: []string{"oc/stale"}},
+	})
+	got := make(map[string][]string, len(lists))
+	for _, list := range lists {
+		got[list.Name] = list.Models
+	}
+	if !reflect.DeepEqual(got["ghrouter/opencode"], []string{"oc/healthy", "oc/expired", "oc/native-ready", "oc/vision"}) {
+		t.Fatalf("unexpected provider list: %#v", got["ghrouter/opencode"])
+	}
+	if !reflect.DeepEqual(got["ghrouter/auto"], []string{"oc/healthy", "oc/expired", "oc/native-ready", "oc/vision"}) {
+		t.Fatalf("unexpected automatic list: %#v", got["ghrouter/auto"])
+	}
+	if !reflect.DeepEqual(got["ghrouter/context-1m"], []string{"oc/healthy"}) {
+		t.Fatalf("unexpected context list: %#v", got["ghrouter/context-1m"])
+	}
+	if !reflect.DeepEqual(got["ghrouter/reasoning"], []string{"oc/healthy"}) {
+		t.Fatalf("unexpected reasoning list: %#v", got["ghrouter/reasoning"])
+	}
+	if !reflect.DeepEqual(got["ghrouter/tool-use"], []string{"oc/healthy"}) {
+		t.Fatalf("unexpected tool-use list: %#v", got["ghrouter/tool-use"])
+	}
+	if !reflect.DeepEqual(got["ghrouter/vision"], []string{"oc/vision"}) {
+		t.Fatalf("unexpected vision list: %#v", got["ghrouter/vision"])
+	}
+}
+
+func assertAllowedEnvKeys(t *testing.T, env map[string]string, wantKeys []string) {
+	t.Helper()
+	allowed := make(map[string]struct{}, len(wantKeys))
+	for _, key := range wantKeys {
+		allowed[key] = struct{}{}
+	}
+	for key := range env {
+		if _, ok := allowed[key]; !ok {
+			t.Fatalf("unexpected env key %q in provider env %#v", key, env)
+		}
+	}
+	for _, key := range wantKeys {
+		if _, ok := env[key]; !ok {
+			t.Fatalf("expected env key %q in provider env %#v", key, env)
+		}
+	}
+}
+
+func writeShim(t *testing.T, path, script string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write shim %s: %v", path, err)
+	}
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func assertContains(t *testing.T, path, want string) {
+	t.Helper()
+	if !strings.Contains(readFile(t, path), want) {
+		t.Fatalf("expected %s to contain %q", path, want)
 	}
 }

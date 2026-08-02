@@ -7,26 +7,198 @@ import (
 
 // Config is the root configuration for the router
 type Config struct {
-	ListenPort int         `yaml:"listen_port"`
-	Providers  []*Provider `yaml:"providers"`
-	Routes     []*Route    `yaml:"routes"`
+	ListenPort   int                `yaml:"listen_port"`
+	Providers    []*Provider        `yaml:"providers"`
+	Routes       []*Route           `yaml:"routes"`
+	ModelLists   []ModelList        `yaml:"model_lists" json:"model_lists,omitempty"`
+	Connections  []Connection       `yaml:"connections,omitempty" json:"connections,omitempty"`
+	Pools        []Pool             `yaml:"pools,omitempty" json:"pools,omitempty"`
+	Combos       []Combo            `yaml:"combos,omitempty" json:"combos,omitempty"`
+	ACL          ACLConfig          `yaml:"acl"`
+	Storage      StorageConfig      `yaml:"storage"`
+	RateLimit    RateLimitConfig    `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
+	Cooldown     CooldownConfig     `yaml:"cooldown,omitempty" json:"cooldown,omitempty"`
+	Health       HealthConfig       `yaml:"health,omitempty" json:"health,omitempty"`
+	Logging      LoggingConfig      `yaml:"logging,omitempty" json:"logging,omitempty"`
+	Server       ServerConfig       `yaml:"server,omitempty" json:"server,omitempty"`
+	Verification VerificationConfig `yaml:"verification,omitempty" json:"verification,omitempty"`
+	LocalBrain   LocalBrainConfig   `yaml:"local_brain,omitempty" json:"local_brain,omitempty"`
+}
+
+type ModelList struct {
+	Name     string   `yaml:"name" json:"name"`
+	Kind     string   `yaml:"kind,omitempty" json:"kind,omitempty"`
+	Models   []string `yaml:"models" json:"models"`
+	Strategy string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+}
+
+type Connection struct {
+	Name     string            `yaml:"name" json:"name"`
+	Provider string            `yaml:"provider" json:"provider"`
+	Model    string            `yaml:"model" json:"model"`
+	Enabled  bool              `yaml:"enabled" json:"enabled"`
+	Metadata map[string]string `yaml:"metadata,omitempty" json:"metadata,omitempty"`
+}
+
+type Pool struct {
+	Name     string   `yaml:"name" json:"name"`
+	Members  []string `yaml:"members" json:"members"`
+	Strategy string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	Enabled  bool     `yaml:"enabled" json:"enabled"`
+}
+
+type Combo struct {
+	Name     string   `yaml:"name" json:"name"`
+	Members  []string `yaml:"members" json:"members"`
+	Strategy string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	Judge    string   `yaml:"judge,omitempty" json:"judge,omitempty"`
+	Enabled  bool     `yaml:"enabled" json:"enabled"`
+}
+
+type StorageConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	Path          string `yaml:"path"`
+	RetentionDays int    `yaml:"retention_days,omitempty" json:"retention_days,omitempty"`
+}
+
+type ACLConfig struct {
+	Enabled  bool                `yaml:"enabled"`
+	Allow    []string            `yaml:"allow"`
+	TokenEnv string              `yaml:"token_env"`
+	KeysFile string              `yaml:"keys_file"`
+	Scopes   map[string][]string `yaml:"scopes,omitempty" json:"scopes,omitempty"`
+}
+
+type RateLimitConfig struct {
+	Enabled           bool `yaml:"enabled" json:"enabled"`
+	RequestsPerMinute int  `yaml:"requests_per_minute" json:"requests_per_minute"`
+	Burst             int  `yaml:"burst" json:"burst"`
+}
+
+type CooldownConfig struct {
+	Enabled         *bool         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	DefaultDuration time.Duration `yaml:"default_duration,omitempty" json:"default_duration,omitempty"`
+	MaxDuration     time.Duration `yaml:"max_duration,omitempty" json:"max_duration,omitempty"`
+}
+
+func (c CooldownConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+type HealthConfig struct {
+	Enabled    *bool         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Interval   time.Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Timeout    time.Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	TestPrompt string        `yaml:"test_prompt,omitempty" json:"test_prompt,omitempty"`
+}
+
+func (c HealthConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+type LoggingConfig struct {
+	Level  string `yaml:"level,omitempty" json:"level,omitempty"`
+	Format string `yaml:"format,omitempty" json:"format,omitempty"`
+	Output string `yaml:"output,omitempty" json:"output,omitempty"`
+	File   string `yaml:"file,omitempty" json:"file,omitempty"`
+	Color  string `yaml:"color,omitempty" json:"color,omitempty"`
+}
+
+type ServerConfig struct {
+	Host         string        `yaml:"host,omitempty" json:"host,omitempty"`
+	ReadTimeout  time.Duration `yaml:"read_timeout,omitempty" json:"read_timeout,omitempty"`
+	WriteTimeout time.Duration `yaml:"write_timeout,omitempty" json:"write_timeout,omitempty"`
+	IdleTimeout  time.Duration `yaml:"idle_timeout,omitempty" json:"idle_timeout,omitempty"`
+}
+
+type VerificationConfig struct {
+	Enabled        *bool         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	Startup        bool          `yaml:"startup,omitempty" json:"startup,omitempty"`
+	Interval       time.Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
+	Timeout        time.Duration `yaml:"timeout,omitempty" json:"timeout,omitempty"`
+	Workers        int           `yaml:"workers,omitempty" json:"workers,omitempty"`
+	BatchSize      int           `yaml:"batch_size,omitempty" json:"batch_size,omitempty"`
+	MaxPerProvider int           `yaml:"max_per_provider,omitempty" json:"max_per_provider,omitempty"`
+}
+
+type LocalBrainConfig struct {
+	Enabled        bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	AutoProvision  bool          `yaml:"auto_provision,omitempty" json:"auto_provision,omitempty"`
+	Backend        string        `yaml:"backend,omitempty" json:"backend,omitempty"`
+	Model          string        `yaml:"model,omitempty" json:"model,omitempty"`
+	Source         string        `yaml:"source,omitempty" json:"source,omitempty"`
+	Host           string        `yaml:"host,omitempty" json:"host,omitempty"`
+	Port           int           `yaml:"port,omitempty" json:"port,omitempty"`
+	StartupTimeout time.Duration `yaml:"startup_timeout,omitempty" json:"startup_timeout,omitempty"`
+	Restart        bool          `yaml:"restart,omitempty" json:"restart,omitempty"`
+	RestartBackoff time.Duration `yaml:"restart_backoff,omitempty" json:"restart_backoff,omitempty"`
+	MaxRestarts    int           `yaml:"max_restarts,omitempty" json:"max_restarts,omitempty"`
+}
+
+func (c VerificationConfig) IsEnabled() bool {
+	return c.Enabled != nil && *c.Enabled
 }
 
 // Provider represents a backend provider (CLI-based)
 type Provider struct {
-	Name       string            `yaml:"name"`
-	Type       ProviderType      `yaml:"type"`
-	CLIPath    string            `yaml:"cli_path"`
-	Args       []string          `yaml:"args"`
-	Env        map[string]string `yaml:"env"`
-	Models     []string          `yaml:"models"`
-	Timeout    time.Duration     `yaml:"timeout"`
-	MaxTokens  int               `yaml:"max_tokens"`
-	WorkDir    string            `yaml:"work_dir"`
-	AuthMethod AuthMethod        `yaml:"auth_method"`
-	AuthConfig map[string]string `yaml:"auth_config"`
-	Account    ProviderAccount   `yaml:"account"`
-	Enabled    bool              `yaml:"enabled"`
+	Name             string               `yaml:"name"`
+	Type             ProviderType         `yaml:"type"`
+	CLIPath          string               `yaml:"cli_path"`
+	BaseURL          string               `yaml:"base_url,omitempty" json:"base_url,omitempty"`
+	Args             []string             `yaml:"args"`
+	Env              map[string]string    `yaml:"env"`
+	Models           []string             `yaml:"models"`
+	ModelInfo        map[string]ModelInfo `yaml:"model_info,omitempty" json:"model_info,omitempty"`
+	Timeout          time.Duration        `yaml:"timeout"`
+	Retries          int                  `yaml:"retries"`
+	RetryBackoff     time.Duration        `yaml:"retry_backoff"`
+	MaxTokens        int                  `yaml:"max_tokens"`
+	WorkDir          string               `yaml:"work_dir"`
+	Protocol         string               `yaml:"protocol,omitempty" json:"protocol,omitempty"`
+	Origin           string               `yaml:"origin,omitempty" json:"origin,omitempty"`
+	CapabilityStatus string               `yaml:"capability_status,omitempty" json:"capability_status,omitempty"`
+	FailureReason    string               `yaml:"failure_reason,omitempty" json:"failure_reason,omitempty"`
+	AuthMethod       AuthMethod           `yaml:"auth_method"`
+	AuthConfig       map[string]string    `yaml:"auth_config"`
+	Account          ProviderAccount      `yaml:"account"`
+	Enabled          bool                 `yaml:"enabled"`
+	Discovery        DiscoveryState       `yaml:"discovery,omitempty" json:"discovery,omitempty"`
+}
+
+type DiscoveryStatus string
+
+const (
+	DiscoveryUnknown     DiscoveryStatus = "unknown"
+	DiscoverySuccess     DiscoveryStatus = "success"
+	DiscoveryEmpty       DiscoveryStatus = "empty"
+	DiscoveryTimeout     DiscoveryStatus = "timeout"
+	DiscoveryAuth        DiscoveryStatus = "auth"
+	DiscoveryError       DiscoveryStatus = "error"
+	DiscoveryUnsupported DiscoveryStatus = "unsupported"
+)
+
+type DiscoveryState struct {
+	Status       DiscoveryStatus `yaml:"status" json:"status"`
+	Error        string          `yaml:"error,omitempty" json:"error,omitempty"`
+	DiscoveredAt time.Time       `yaml:"discovered_at,omitempty" json:"discovered_at,omitempty"`
+}
+
+type ModelInfo struct {
+	Provider          string    `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Model             string    `json:"model,omitempty" yaml:"model,omitempty"`
+	TokenCost         int       `json:"token_cost,omitempty" yaml:"token_cost,omitempty"`
+	ContextWindow     int       `json:"context_window,omitempty" yaml:"context_window,omitempty"`
+	MaxOutput         int       `json:"max_output,omitempty" yaml:"max_output,omitempty"`
+	Thinking          bool      `json:"thinking,omitempty" yaml:"thinking,omitempty"`
+	Vision            bool      `json:"vision,omitempty" yaml:"vision,omitempty"`
+	ToolUse           bool      `json:"tool_use,omitempty" yaml:"tool_use,omitempty"`
+	Effort            []string  `json:"effort,omitempty" yaml:"effort,omitempty"`
+	Source            string    `json:"source,omitempty" yaml:"source,omitempty"`
+	DiscoveredAt      time.Time `json:"discovered_at,omitempty" yaml:"discovered_at,omitempty"`
+	HealthStatus      string    `json:"health_status,omitempty" yaml:"health_status,omitempty"`
+	CooldownUntil     time.Time `json:"cooldown_until,omitempty" yaml:"cooldown_until,omitempty"`
+	VerifiedAt        time.Time `json:"verified_at,omitempty" yaml:"verified_at,omitempty"`
+	VerificationError string    `json:"verification_error,omitempty" yaml:"verification_error,omitempty"`
 }
 
 // ProviderType identifies the provider kind
@@ -39,6 +211,7 @@ const (
 	ProviderMimo       ProviderType = "mimo"
 	ProviderPi         ProviderType = "pi"
 	ProviderCursor     ProviderType = "cursor"
+	ProviderLocal      ProviderType = "local"
 	ProviderOpenAI     ProviderType = "openai"
 	ProviderAnthropic  ProviderType = "anthropic"
 	ProviderAzure      ProviderType = "azure"
@@ -58,9 +231,15 @@ const (
 
 // Route maps model patterns to providers
 type Route struct {
-	Pattern  string   `yaml:"pattern"`
-	Provider string   `yaml:"provider"`
-	Fallback []string `yaml:"fallback"`
+	Pattern       string        `yaml:"pattern"`
+	Provider      string        `yaml:"provider"`
+	Fallback      []string      `yaml:"fallback"`
+	Mode          string        `yaml:"mode,omitempty" json:"mode,omitempty"`
+	Judge         string        `yaml:"judge,omitempty" json:"judge,omitempty"`
+	MaxCandidates int           `yaml:"max_candidates,omitempty" json:"max_candidates,omitempty"`
+	JudgeTimeout  time.Duration `yaml:"judge_timeout,omitempty" json:"judge_timeout,omitempty"`
+	FirstComplete bool          `yaml:"first_complete,omitempty" json:"first_complete,omitempty"`
+	MaxCostMicros int64         `yaml:"max_cost_micros,omitempty" json:"max_cost_micros,omitempty"`
 }
 
 type ProviderAccount struct {
@@ -97,6 +276,8 @@ func (a ProviderAccount) String() string {
 // OpenAIRequest is the incoming request from gh copilot (OpenAI Chat Completions format)
 type OpenAIRequest struct {
 	Model       string          `json:"model"`
+	SessionID   string          `json:"-"`
+	RequestID   string          `json:"-"`
 	Messages    []OpenAIMessage `json:"messages"`
 	Temperature *float64        `json:"temperature,omitempty"`
 	TopP        *float64        `json:"top_p,omitempty"`

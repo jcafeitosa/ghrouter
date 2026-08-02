@@ -21,6 +21,15 @@ type Status struct {
 	Available bool      `json:"available"`
 }
 
+func Blocked(status Status) bool {
+	switch status.Source {
+	case "unavailable", "missing-provider", "unknown":
+		return false
+	default:
+		return !status.Available || !status.Healthy
+	}
+}
+
 func Load(p *types.Provider) Status {
 	if p == nil {
 		return Status{Available: false, Healthy: false, Source: "missing-provider"}
@@ -28,7 +37,19 @@ func Load(p *types.Provider) Status {
 	if status, ok := loadJSONStatus(p); ok {
 		return status
 	}
-	s := Status{Available: true, Healthy: true, Source: "env"}
+	if isUnsupportedProvider(p) {
+		return Status{Available: false, Healthy: false, Source: "unsupported"}
+	}
+	if hasAccountMetadata(p) {
+		return buildAccountMetadataStatus(p)
+	}
+	if !hasAuthSignal(p) {
+		if isRecognizedProvider(p) {
+			return Status{Available: false, Healthy: false, Source: "auth"}
+		}
+		return Status{Available: false, Healthy: false, Source: "unavailable"}
+	}
+	s := Status{Available: true, Healthy: true, Source: "unknown"}
 	keyBase := providerKey(p.Name)
 	s.Plan = firstNonEmpty(
 		p.AuthConfig["plan"],
@@ -54,10 +75,35 @@ func Load(p *types.Provider) Status {
 			s.ResetAt = ts
 		}
 	}
-	if s.Plan == "" && s.Balance == nil && s.Currency == "" && s.ResetAt.IsZero() {
-		s.Source = "unavailable"
-		s.Available = false
-		s.Healthy = false
+	return s
+}
+
+func buildAccountMetadataStatus(p *types.Provider) Status {
+	s := Status{Available: true, Healthy: true, Source: "unknown"}
+	keyBase := providerKey(p.Name)
+	s.Plan = firstNonEmpty(
+		p.AuthConfig["plan"],
+		lookupEnv(keyBase, "PLAN"),
+		lookupEnv("GHR_PROVIDER", "PLAN"),
+	)
+	s.Currency = firstNonEmpty(
+		p.AuthConfig["balance_currency"],
+		lookupEnv(keyBase, "BALANCE_CURRENCY"),
+		lookupEnv("GHR_PROVIDER", "BALANCE_CURRENCY"),
+	)
+	s.Balance = parseOptionalFloat(firstNonEmpty(
+		p.AuthConfig["balance"],
+		lookupEnv(keyBase, "BALANCE"),
+		lookupEnv("GHR_PROVIDER", "BALANCE"),
+	))
+	if raw := firstNonEmpty(
+		p.AuthConfig["reset_at"],
+		lookupEnv(keyBase, "RESET_AT"),
+		lookupEnv("GHR_PROVIDER", "RESET_AT"),
+	); raw != "" {
+		if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+			s.ResetAt = ts
+		}
 	}
 	return s
 }
@@ -71,20 +117,135 @@ func loadJSONStatus(p *types.Provider) (Status, bool) {
 	if raw == "" {
 		return Status{}, false
 	}
-	var status Status
-	if err := json.Unmarshal([]byte(raw), &status); err != nil {
+	var payload struct {
+		Plan      string    `json:"plan,omitempty"`
+		Balance   *float64  `json:"balance,omitempty"`
+		Currency  string    `json:"currency,omitempty"`
+		ResetAt   time.Time `json:"reset_at,omitempty"`
+		Source    string    `json:"source,omitempty"`
+		Healthy   *bool     `json:"healthy,omitempty"`
+		Available *bool     `json:"available,omitempty"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
 		return Status{Available: false, Healthy: false, Source: "invalid-json"}, true
+	}
+	status := Status{
+		Plan:      payload.Plan,
+		Balance:   payload.Balance,
+		Currency:  payload.Currency,
+		ResetAt:   payload.ResetAt,
+		Source:    payload.Source,
+		Available: true,
+		Healthy:   true,
+	}
+	if payload.Available != nil {
+		status.Available = *payload.Available
+	}
+	if payload.Healthy != nil {
+		status.Healthy = *payload.Healthy
 	}
 	if status.Source == "" {
 		status.Source = "json"
 	}
-	if !status.Available {
-		status.Available = true
-	}
-	if !status.Healthy {
-		status.Healthy = true
-	}
 	return status, true
+}
+
+func isUnsupportedProvider(p *types.Provider) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Type {
+	case types.ProviderCustom:
+		return true
+	case types.ProviderLocal:
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Name)) {
+	case "custom":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRecognizedProvider(p *types.Provider) bool {
+	if p == nil {
+		return false
+	}
+	switch p.Type {
+	case types.ProviderClaudeCode, types.ProviderCodex, types.ProviderOpenCode, types.ProviderMimo, types.ProviderPi, types.ProviderCursor, types.ProviderOpenAI, types.ProviderAnthropic, types.ProviderAzure, types.ProviderOllama:
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Name)) {
+	case "claude", "claude-code", "codex", "opencode", "mimo", "pi", "cursor", "openai", "anthropic", "azure", "ollama":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasAuthSignal(p *types.Provider) bool {
+	if p == nil {
+		return false
+	}
+	for _, key := range authEnvKeysForProvider(p) {
+		if strings.TrimSpace(os.Getenv(key)) != "" {
+			return true
+		}
+	}
+	for _, key := range []string{"plan", "balance", "balance_currency", "reset_at", "account_json"} {
+		if strings.TrimSpace(p.AuthConfig[key]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAccountMetadata(p *types.Provider) bool {
+	if p == nil {
+		return false
+	}
+	for _, key := range []string{"plan", "balance", "balance_currency", "reset_at"} {
+		if strings.TrimSpace(p.AuthConfig[key]) != "" {
+			return true
+		}
+	}
+	for _, key := range []string{"PLAN", "BALANCE", "BALANCE_CURRENCY", "RESET_AT"} {
+		if strings.TrimSpace(lookupEnv(providerKey(p.Name), key)) != "" || strings.TrimSpace(lookupEnv("GHR_PROVIDER", key)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func authEnvKeysForProvider(p *types.Provider) []string {
+	if p == nil {
+		return nil
+	}
+	switch p.Type {
+	case types.ProviderClaudeCode:
+		return []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+	case types.ProviderCodex:
+		return []string{"OPENAI_API_KEY", "OPENAI_API_BASE", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_HOME"}
+	case types.ProviderOpenCode:
+		return []string{"OPENAI_API_KEY", "OPENAI_API_BASE", "OPENCODE_API_KEY", "OPENCODE_HOME"}
+	case types.ProviderMimo:
+		return []string{"OPENAI_API_KEY", "MIMO_API_KEY", "MIMO_HOME"}
+	case types.ProviderPi:
+		return []string{"PI_HOME", "OPENAI_API_KEY"}
+	case types.ProviderCursor:
+		return []string{"CURSOR_API_KEY", "CURSOR_API_ENDPOINT"}
+	case types.ProviderOpenAI:
+		return []string{"OPENAI_API_KEY", "OPENAI_API_BASE"}
+	case types.ProviderAnthropic:
+		return []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"}
+	case types.ProviderAzure:
+		return []string{"AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"}
+	case types.ProviderOllama:
+		return nil
+	default:
+		return nil
+	}
 }
 
 func Weight(status Status) float64 {
