@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"ghrouter/internal/detectors"
 	"ghrouter/internal/providers"
 	"ghrouter/internal/types"
 )
@@ -113,8 +112,6 @@ func TestLiveSnapshotIncludesConfiguredModelInfoOnlyAndExcludesCooldown(t *testi
 			},
 		},
 	}
-	detectors.EnrichProviderModels(cfg.Providers[0])
-
 	srv := NewWithConfigPath(cfg, filepath.Join(t.TempDir(), "config.yaml"))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)

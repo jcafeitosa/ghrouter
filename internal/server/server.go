@@ -292,6 +292,7 @@ func NewWithConfigPath(cfg *types.Config, configPath string) *Server {
 }
 
 func newServer(cfg *types.Config, configPath string) *Server {
+	normalizeConfiguredProviders(cfg)
 	cfg.ModelLists = detectors.BuildAutomaticModelLists(cfg.Providers, cfg.ModelLists)
 	s := &Server{cfg: cfg, configPath: configPath, providers: make(map[string]*providers.ProviderRunner), rrCursor: make(map[string]int), sticky: make(map[string]stickyRoute), started: time.Now(), telemetry: newTelemetryState(), authCache: make(map[string]authCacheEntry), rateWindow: make(map[string]rateWindow), verifyNext: make(map[string]int)}
 	healthInterval := cfg.Health.Interval
@@ -667,6 +668,7 @@ func (s *Server) applyModelVerification(results []ModelTestResult, verifiedAt ti
 			provider.ModelInfo[result.Model] = info
 		}
 	}
+	normalizeConfiguredProviders(s.cfg)
 	s.cfg.ModelLists = detectors.BuildAutomaticModelLists(s.cfg.Providers, s.cfg.ModelLists)
 	if s.configPath != "" {
 		if err := config.Save(s.configPath, s.cfg); err != nil {
@@ -818,6 +820,8 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 				current.AuthConfig = provider.AuthConfig
 				current.Account = provider.Account
 				current.Enabled = provider.Enabled
+				current.Models = append([]string(nil), provider.Models...)
+				current.ModelInfo = cloneModelInfoMap(provider.ModelInfo)
 			}
 		}
 	}
@@ -828,6 +832,26 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 		}
 	}
 	return nil
+}
+
+func normalizeConfiguredProviders(cfg *types.Config) {
+	if cfg == nil {
+		return
+	}
+	for _, provider := range cfg.Providers {
+		detectors.EnrichProviderModels(provider)
+	}
+}
+
+func cloneModelInfoMap(values map[string]types.ModelInfo) map[string]types.ModelInfo {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]types.ModelInfo, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *Server) providerPath(name string) string {
