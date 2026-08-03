@@ -777,10 +777,11 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 			return fmt.Errorf("nil provider is not reloadable")
 		}
 		current := s.providers[provider.Name]
-		if current == nil || provider.CLIPath != s.providerPath(provider.Name) || !sameStrings(provider.Models, current.GetModels()) {
+		if current == nil || provider.CLIPath != s.providerPath(provider.Name) {
 			return fmt.Errorf("provider %s change requires restart", provider.Name)
 		}
 	}
+	normalizeConfiguredProviders(next)
 	next.ModelLists = detectors.BuildAutomaticModelLists(next.Providers, next.ModelLists)
 	healthInterval := next.Health.Interval
 	if healthInterval <= 0 {
@@ -826,6 +827,18 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 		}
 	}
 	s.mu.Unlock()
+	if s.catalog != nil {
+		for _, provider := range s.cfg.Providers {
+			if provider == nil {
+				continue
+			}
+			if !provider.Enabled {
+				s.catalog.UnregisterProvider(provider.Name)
+				continue
+			}
+			s.catalog.RegisterProvider(provider.Name, buildCatalogModels(provider))
+		}
+	}
 	if store := s.getStore(); store != nil {
 		if err := s.persistStorageState(); err != nil {
 			return fmt.Errorf("persist reloaded configuration: %w", err)

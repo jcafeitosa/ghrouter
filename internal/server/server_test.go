@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"ghrouter/internal/catalog"
+	"ghrouter/internal/health"
 	"ghrouter/internal/providers"
 	"ghrouter/internal/types"
 )
@@ -94,6 +96,7 @@ func TestLiveSnapshotIncludesConfiguredModelInfoOnlyAndExcludesCooldown(t *testi
 			{
 				Name:    "opencode",
 				Type:    types.ProviderOpenCode,
+				CLIPath: "/bin/true",
 				Enabled: true,
 				ModelInfo: map[string]types.ModelInfo{
 					"oc/good": {
@@ -200,6 +203,87 @@ func TestLiveSnapshotIncludesConfiguredModelInfoOnlyAndExcludesCooldown(t *testi
 	}
 }
 
+func TestReloadConfigReRegistersLiveCatalogAndKeepsCooldownState(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := &types.Config{
+		Providers: []*types.Provider{
+			{
+				Name:    "opencode",
+				Type:    types.ProviderOpenCode,
+				CLIPath: "/bin/true",
+				Enabled: true,
+				ModelInfo: map[string]types.ModelInfo{
+					"oc/old": {
+						Source:       "configured",
+						VerifiedAt:   now,
+						HealthStatus: "healthy",
+					},
+					"oc/persist": {
+						Source:        "configured",
+						VerifiedAt:    now,
+						HealthStatus:  "failed",
+						CooldownUntil: now.Add(time.Hour),
+					},
+				},
+			},
+		},
+	}
+	srv := NewWithConfigPath(cfg, filepath.Join(t.TempDir(), "config.yaml"))
+
+	initial := srv.LiveSnapshot()
+	if got := summaryIDs(initial.Models); !sliceContainsAll(got, "oc/old") || sliceContainsAny(got, "oc/new") {
+		t.Fatalf("unexpected initial live models: %#v", got)
+	}
+	if got := catalogIDs(srv.catalog.GetAllModels()); !sliceContainsAll(got, "oc/old") || !sliceContainsAll(got, "oc/persist") {
+		t.Fatalf("unexpected initial catalog models: %#v", got)
+	}
+
+	next := &types.Config{
+		Providers: []*types.Provider{
+			{
+				Name:    "opencode",
+				Type:    types.ProviderOpenCode,
+				CLIPath: "/bin/true",
+				Enabled: true,
+				ModelInfo: map[string]types.ModelInfo{
+					"oc/new": {
+						Source:       "configured",
+						VerifiedAt:   now.Add(time.Minute),
+						HealthStatus: "healthy",
+					},
+					"oc/persist": {
+						Source:       "configured",
+						VerifiedAt:   now.Add(time.Minute),
+						HealthStatus: "healthy",
+					},
+				},
+			},
+		},
+	}
+	if err := srv.ReloadConfig(next); err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+
+	live := srv.LiveSnapshot()
+	ids := summaryIDs(live.Models)
+	if !sliceContainsAll(ids, "oc/new") {
+		t.Fatalf("expected reloaded inventory to include oc/new, got %#v", ids)
+	}
+	if sliceContainsAny(ids, "oc/old") {
+		t.Fatalf("expected stale oc/old to be removed after reload, got %#v", ids)
+	}
+	if sliceContainsAny(ids, "oc/persist") {
+		t.Fatalf("expected fail-closed oc/persist to stay excluded, got %#v", ids)
+	}
+	if got := catalogIDs(srv.catalog.GetAllModels()); !sliceContainsAll(got, "oc/new", "oc/persist") || sliceContainsAny(got, "oc/old") {
+		t.Fatalf("unexpected catalog models after reload: %#v", got)
+	}
+	persisted := srv.catalog.GetModel("oc/persist")
+	if persisted == nil || persisted.HealthStatus != health.HealthCooldown || persisted.CooldownUntil.Before(time.Now()) {
+		t.Fatalf("expected oc/persist cooldown to survive reload, got %+v", persisted)
+	}
+}
+
 func TestRouteModelReturnsCanonicalID(t *testing.T) {
 	srv := New(&types.Config{
 		Providers: []*types.Provider{
@@ -293,6 +377,50 @@ func TestLiveSnapshotJSONIncludesAccountStatus(t *testing.T) {
 	if !strings.Contains(string(payload), `"account"`) {
 		t.Fatalf("expected account field in live snapshot JSON, got %s", string(payload))
 	}
+}
+
+func summaryIDs(models []ModelSummary) []string {
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		ids = append(ids, model.ID)
+	}
+	return ids
+}
+
+func catalogIDs(models []*catalog.ModelEntry) []string {
+	ids := make([]string, 0, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		ids = append(ids, model.ID)
+	}
+	return ids
+}
+
+func sliceContainsAll(values []string, wants ...string) bool {
+	for _, want := range wants {
+		found := false
+		for _, value := range values {
+			if value == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func sliceContainsAny(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestHandleLiveRespondsOnV1Path(t *testing.T) {
