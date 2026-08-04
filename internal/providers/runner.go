@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,8 +21,32 @@ import (
 
 // ProviderRunner executes a single request against a CLI provider
 type ProviderRunner struct {
-	prov   *types.Provider
-	health *ProviderHealth
+	prov          *types.Provider
+	health        *ProviderHealth
+	circuit       *circuitState
+	acpPool       *genericACPWarmPool
+	localHTTPGate chan struct{}
+}
+
+var localHTTPGates sync.Map
+
+func localHTTPGateFor(baseURL string) chan struct{} {
+	key := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	gate, _ := localHTTPGates.LoadOrStore(key, make(chan struct{}, 1))
+	return gate.(chan struct{})
+}
+
+func AcquireLocalHTTP(ctx context.Context, baseURL string) (func(), error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return func() {}, nil
+	}
+	gate := localHTTPGateFor(baseURL)
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 type EmptyResponseError struct {
@@ -42,14 +69,143 @@ type ProviderHealth struct {
 	Available bool
 }
 
+type CircuitOpenError struct {
+	Provider string
+	RetryAt  time.Time
+}
+
+func (e *CircuitOpenError) Error() string {
+	if e == nil || e.Provider == "" {
+		return "provider circuit is open"
+	}
+	return fmt.Sprintf("provider %s circuit is open", e.Provider)
+}
+
+type CircuitPolicy struct {
+	Enabled          bool
+	FailureThreshold int
+	OpenDuration     time.Duration
+}
+
+type circuitState struct {
+	mu          sync.Mutex
+	policy      CircuitPolicy
+	failures    int
+	openedAt    time.Time
+	probeActive bool
+}
+
 func NewProviderRunner(p *types.Provider) *ProviderRunner {
-	return &ProviderRunner{
-		prov: p,
+	runner := &ProviderRunner{
+		prov:    p,
+		circuit: newCircuitState(),
+		acpPool: &genericACPWarmPool{},
 		health: &ProviderHealth{
 			Status:    "unknown",
 			Available: true,
 		},
 	}
+	if p != nil && p.Type == types.ProviderLocal && strings.TrimSpace(p.BaseURL) != "" {
+		runner.localHTTPGate = localHTTPGateFor(p.BaseURL)
+	}
+	return runner
+}
+
+func (r *ProviderRunner) acquireLocalHTTP(ctx context.Context) (func(), error) {
+	if r == nil || r.localHTTPGate == nil {
+		return func() {}, nil
+	}
+	select {
+	case r.localHTTPGate <- struct{}{}:
+		return func() { <-r.localHTTPGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (r *ProviderRunner) Close() {
+	if r != nil && r.acpPool != nil {
+		r.acpPool.Close()
+	}
+}
+
+func newCircuitState() *circuitState {
+	return &circuitState{policy: CircuitPolicy{Enabled: true, FailureThreshold: 3, OpenDuration: 30 * time.Second}}
+}
+
+func (r *ProviderRunner) SetCircuitPolicy(policy CircuitPolicy) {
+	if r == nil || r.circuit == nil {
+		return
+	}
+	if policy.FailureThreshold <= 0 {
+		policy.FailureThreshold = 3
+	}
+	if policy.OpenDuration <= 0 {
+		policy.OpenDuration = 30 * time.Second
+	}
+	r.circuit.mu.Lock()
+	r.circuit.policy = policy
+	if !policy.Enabled {
+		r.circuit.failures = 0
+		r.circuit.openedAt = time.Time{}
+		r.circuit.probeActive = false
+	}
+	r.circuit.mu.Unlock()
+}
+
+func (r *ProviderRunner) allowCircuitRequest() (*CircuitOpenError, bool) {
+	if r == nil || r.circuit == nil {
+		return nil, true
+	}
+	now := time.Now()
+	r.circuit.mu.Lock()
+	defer r.circuit.mu.Unlock()
+	if !r.circuit.policy.Enabled || r.circuit.openedAt.IsZero() {
+		return nil, true
+	}
+	if now.Sub(r.circuit.openedAt) < r.circuit.policy.OpenDuration || r.circuit.probeActive {
+		return &CircuitOpenError{Provider: r.prov.Name, RetryAt: r.circuit.openedAt.Add(r.circuit.policy.OpenDuration)}, false
+	}
+	r.circuit.probeActive = true
+	return nil, true
+}
+
+func (r *ProviderRunner) recordCircuitSuccess() {
+	if r == nil || r.circuit == nil {
+		return
+	}
+	r.circuit.mu.Lock()
+	r.circuit.failures = 0
+	r.circuit.openedAt = time.Time{}
+	r.circuit.probeActive = false
+	r.circuit.mu.Unlock()
+}
+
+func (r *ProviderRunner) recordCircuitFailure(err error) bool {
+	if r == nil || r.circuit == nil || err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	r.circuit.mu.Lock()
+	defer r.circuit.mu.Unlock()
+	if !r.circuit.policy.Enabled {
+		return false
+	}
+	r.circuit.probeActive = false
+	r.circuit.failures++
+	if r.circuit.failures >= r.circuit.policy.FailureThreshold {
+		r.circuit.openedAt = time.Now()
+		return true
+	}
+	return false
+}
+
+func (r *ProviderRunner) circuitCanProbe() bool {
+	if r == nil || r.circuit == nil {
+		return true
+	}
+	r.circuit.mu.Lock()
+	defer r.circuit.mu.Unlock()
+	return !r.circuit.policy.Enabled || r.circuit.openedAt.IsZero() || (!r.circuit.probeActive && time.Since(r.circuit.openedAt) >= r.circuit.policy.OpenDuration)
 }
 
 // Invoke runs a single request and streams responses
@@ -60,10 +216,25 @@ func (r *ProviderRunner) Invoke(ctx context.Context, req *types.OpenAIRequest) (
 	go func() {
 		defer close(eventCh)
 		defer close(errCh)
+		if circuitErr, allowed := r.allowCircuitRequest(); !allowed {
+			r.health.mu.Lock()
+			r.health.Status = "circuit_open"
+			r.health.Available = false
+			r.health.Error = circuitErr
+			r.health.LastCheck = time.Now()
+			r.health.mu.Unlock()
+			errCh <- circuitErr
+			return
+		}
 
 		start := time.Now()
 		log := observability.Logger("provider").With("provider", r.prov.Name, "model", req.Model, "request_id", req.RequestID)
-		log.Debug("provider_request_started")
+		maxTokens := 0
+		if req.MaxTokens != nil {
+			maxTokens = *req.MaxTokens
+		}
+		stream := req.Stream != nil && *req.Stream
+		log.Debug("provider_request_started", "stream", stream, "tools", len(req.Tools), "max_tokens", maxTokens)
 		err := r.executeCLI(ctx, req, eventCh)
 		latency := time.Since(start)
 
@@ -71,16 +242,22 @@ func (r *ProviderRunner) Invoke(ctx context.Context, req *types.OpenAIRequest) (
 		r.health.LastCheck = time.Now()
 		r.health.Latency = latency
 		if err != nil {
+			circuitOpened := r.recordCircuitFailure(err)
 			log.Error("provider_request_failed", "error", observability.PublicError(err), "error_type", observability.ErrorType(err), observability.Since(start))
 			r.health.Status = "error"
 			r.health.Error = err
+			if circuitOpened {
+				r.health.Available = false
+				r.health.Status = "circuit_open"
+			}
 			errCh <- err
 		} else {
+			r.recordCircuitSuccess()
 			log.Info("provider_request_completed", observability.Since(start))
 			r.health.Status = "healthy"
 			r.health.Error = nil
 			r.health.Available = true
-			eventCh <- &StreamEvent{ID: fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), Model: req.Model, Done: true}
+			_ = emitStreamEvent(ctx, eventCh, &StreamEvent{ID: fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()), Model: req.Model, Done: true})
 		}
 		r.health.mu.Unlock()
 	}()
@@ -131,14 +308,26 @@ func (r *ProviderRunner) executeCLIOnce(ctx context.Context, req *types.OpenAIRe
 		commandCtx, cancel = context.WithTimeout(ctx, r.prov.Timeout)
 		defer cancel()
 	}
+	if r.prov.Type == types.ProviderNVIDIA && strings.TrimSpace(r.prov.BaseURL) != "" {
+		return r.executeHTTP(commandCtx, req, eventCh, emitted)
+	}
 	if strings.TrimSpace(r.prov.BaseURL) != "" {
 		return r.executeHTTP(commandCtx, req, eventCh, emitted)
+	}
+	if r.prov.Type == types.ProviderCursor {
+		return r.executeCursorACP(commandCtx, req, eventCh, emitted)
+	}
+	if r.prov.Protocol == "acp" && r.prov.Type == types.ProviderOpenCode {
+		if r.prov.Harness.Observed() && r.prov.Harness.SupportsServer {
+			return r.acpPool.do(commandCtx, r, req, eventCh, emitted)
+		}
+		return r.executeGenericACP(commandCtx, req, eventCh, emitted)
 	}
 	// Build prompt from messages
 	prompt := r.buildPrompt(req)
 
 	adapter := adapterFor(r.prov.Type)
-	args := adapter.BuildArgs(r.prov, req.Model)
+	args := adapter.BuildArgs(r.prov, req.Model, req.ReasoningEffort)
 	if adapter.PromptOnArgs() {
 		args = append(args, prompt)
 	}
@@ -175,7 +364,7 @@ func (r *ProviderRunner) executeCLIOnce(ctx context.Context, req *types.OpenAIRe
 	}()
 
 	// Write prompt to stdin
-	if r.prov.Type == types.ProviderCursor {
+	if adapter.PromptOnArgs() {
 		_ = stdin.Close()
 	} else {
 		go func() {
@@ -193,7 +382,7 @@ func (r *ProviderRunner) executeCLIOnce(ctx context.Context, req *types.OpenAIRe
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var parseErr error
 	for scanner.Scan() {
-		meaningful, err := r.parseLineAndMaybeEmit(scanner.Text(), eventCh, req.Model, false)
+		meaningful, err := r.parseLineAndMaybeEmitContext(commandCtx, scanner.Text(), eventCh, req.Model, false)
 		if meaningful {
 			*emitted = true
 		}
@@ -209,6 +398,9 @@ func (r *ProviderRunner) executeCLIOnce(ctx context.Context, req *types.OpenAIRe
 	if err := cmd.Wait(); err != nil {
 		if commandErr := commandCtx.Err(); commandErr != nil {
 			return commandErr
+		}
+		if parseErr != nil {
+			return parseErr
 		}
 		return fmt.Errorf("CLI exited with error: %w, stderr: %s", err, string(<-stderrDone))
 	}
@@ -229,7 +421,7 @@ func buildCLIArgs(provider *types.Provider, requestedModel string) []string {
 	if provider == nil {
 		return nil
 	}
-	return adapterFor(provider.Type).BuildArgs(provider, requestedModel)
+	return adapterFor(provider.Type).BuildArgs(provider, requestedModel, "")
 }
 
 func hasModelFlag(args []string) bool {
@@ -253,7 +445,9 @@ func (r *ProviderRunner) buildPrompt(req *types.OpenAIRequest) string {
 			for _, part := range v {
 				if m, ok := part.(map[string]interface{}); ok {
 					if m["type"] == "text" {
-						content += m["text"].(string)
+						if text, ok := m["text"].(string); ok {
+							content += text
+						}
 					}
 				}
 			}
@@ -266,34 +460,96 @@ func (r *ProviderRunner) buildPrompt(req *types.OpenAIRequest) string {
 }
 
 func (r *ProviderRunner) buildEnv() []string {
-	env := make([]string, 0, len(r.prov.Env)+len(os.Environ()))
-	for k, v := range r.prov.Env {
-		env = append(env, fmt.Sprintf("%s=%s", k, v))
-	}
+	values := make(map[string]string, len(r.prov.Env)+len(os.Environ()))
 	for _, entry := range os.Environ() {
-		key, _, ok := strings.Cut(entry, "=")
-		if ok && isRouterClientEnv(key) {
+		key, value, ok := strings.Cut(entry, "=")
+		if ok && providerInheritedEnvAllowed(r.prov.Type, key) {
+			values[key] = value
+		}
+	}
+	for k, v := range r.prov.Env {
+		if isRouterClientEnv(k) {
 			continue
 		}
-		env = append(env, entry)
+		values[k] = v
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, fmt.Sprintf("%s=%s", key, values[key]))
 	}
 	return env
 }
 
 func isRouterClientEnv(key string) bool {
+	if strings.HasPrefix(key, "GHR_") || strings.HasPrefix(key, "COPILOT_PROVIDER_") {
+		return true
+	}
 	switch key {
-	case "GHR_ACCESS_TOKEN", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "COPILOT_PROVIDER_BASE_URL", "COPILOT_PROVIDER_TYPE", "COPILOT_PROVIDER_API_KEY", "COPILOT_PROVIDER_BEARER_TOKEN", "COPILOT_PROVIDER_HEADERS", "COPILOT_PROVIDER_WIRE_API", "COPILOT_PROVIDER_WIRE_MODEL", "CURSOR_API_ENDPOINT", "CURSOR_API_KEY":
+	case "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "OPENAI_BASE_URL", "OPENAI_API_BASE", "CURSOR_API_ENDPOINT", "CURSOR_API_KEY":
 		return true
 	default:
 		return false
 	}
 }
 
-func (r *ProviderRunner) parseLineAndEmit(line string, ch chan<- *StreamEvent, model string) {
-	_, _ = r.parseLineAndMaybeEmit(line, ch, model, true)
+func providerInheritedEnvAllowed(providerType types.ProviderType, key string) bool {
+	if isRouterClientEnv(key) {
+		return false
+	}
+	if isCommonRuntimeEnv(key) {
+		return true
+	}
+	for _, allowed := range providerCredentialEnv(providerType) {
+		if key == allowed {
+			return true
+		}
+	}
+	return false
 }
 
-func (r *ProviderRunner) parseLineAndMaybeEmit(line string, ch chan<- *StreamEvent, model string, emitErrors bool) (bool, error) {
+func isCommonRuntimeEnv(key string) bool {
+	if strings.HasPrefix(key, "LC_") || strings.HasPrefix(key, "XDG_") {
+		return true
+	}
+	switch key {
+	case "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "TMPDIR", "TMP", "TEMP", "LANG", "TERM", "COLORTERM", "NO_COLOR", "CI":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerCredentialEnv(providerType types.ProviderType) []string {
+	switch providerType {
+	case types.ProviderClaudeCode:
+		return []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
+	case types.ProviderCodex:
+		return []string{"OPENAI_API_KEY", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_HOME"}
+	case types.ProviderOpenCode:
+		return []string{"OPENAI_API_KEY", "OPENCODE_API_KEY", "OPENCODE_HOME"}
+	case types.ProviderMimo:
+		return []string{"OPENAI_API_KEY", "MIMO_API_KEY", "MIMO_HOME"}
+	case types.ProviderPi:
+		return []string{"PI_HOME", "PI_CODING_AGENT_DIR", "OPENAI_API_KEY", "GOOGLE_API_KEY", "PI_API_KEY"}
+	case types.ProviderCursor:
+		return []string{"CURSOR_API_KEY"}
+	case types.ProviderNVIDIA:
+		return []string{"NVIDIA_API_KEY"}
+	default:
+		return nil
+	}
+}
+
+func (r *ProviderRunner) parseLineAndEmit(line string, ch chan<- *StreamEvent, model string) {
+	_, _ = r.parseLineAndMaybeEmitContext(context.Background(), line, ch, model, true)
+}
+
+func (r *ProviderRunner) parseLineAndMaybeEmitContext(ctx context.Context, line string, ch chan<- *StreamEvent, model string, emitErrors bool) (bool, error) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return false, nil
@@ -302,44 +558,127 @@ func (r *ProviderRunner) parseLineAndMaybeEmit(line string, ch chan<- *StreamEve
 	var jsonMsg map[string]interface{}
 	if err := json.Unmarshal([]byte(line), &jsonMsg); err == nil {
 		if message := structuredError(jsonMsg); message != "" {
-			event.Error = fmt.Errorf("provider reported error: %s", message)
+			event.Error = structuredProviderError(jsonMsg)
 			if emitErrors {
-				ch <- &event
+				if !emitStreamEvent(ctx, ch, &event) {
+					return false, ctx.Err()
+				}
 			}
 			return false, event.Error
 		}
 		if text := responseText(jsonMsg); text != "" {
+			if providerErr := providerOutputError(text); providerErr != nil {
+				if emitErrors {
+					event.Error = providerErr
+					if !emitStreamEvent(ctx, ch, &event) {
+						return false, ctx.Err()
+					}
+				}
+				return false, providerErr
+			}
 			event.Delta = text
-			ch <- &event
+			if !emitStreamEvent(ctx, ch, &event) {
+				return false, ctx.Err()
+			}
 			return true, nil
 		}
 		event.ToolCalls = parseToolCalls(jsonMsg)
 		if content, ok := jsonMsg["content"].(string); ok {
+			if providerErr := providerOutputError(content); providerErr != nil {
+				if emitErrors {
+					event.Error = providerErr
+					if !emitStreamEvent(ctx, ch, &event) {
+						return false, ctx.Err()
+					}
+				}
+				return false, providerErr
+			}
 			event.Delta = content
-			ch <- &event
+			if !emitStreamEvent(ctx, ch, &event) {
+				return false, ctx.Err()
+			}
 			return content != "", nil
 		}
 		if text, ok := jsonMsg["text"].(string); ok {
+			if providerErr := providerOutputError(text); providerErr != nil {
+				if emitErrors {
+					event.Error = providerErr
+					if !emitStreamEvent(ctx, ch, &event) {
+						return false, ctx.Err()
+					}
+				}
+				return false, providerErr
+			}
 			event.Delta = text
-			ch <- &event
+			if !emitStreamEvent(ctx, ch, &event) {
+				return false, ctx.Err()
+			}
 			return text != "", nil
 		}
 		if len(event.ToolCalls) > 0 {
-			ch <- &event
+			if !emitStreamEvent(ctx, ch, &event) {
+				return false, ctx.Err()
+			}
 			return true, nil
 		}
 		if done, ok := jsonMsg["done"].(bool); ok && done {
 			event.Done = true
-			ch <- &event
+			if !emitStreamEvent(ctx, ch, &event) {
+				return false, ctx.Err()
+			}
 			return false, nil
 		}
 	}
 	if !strings.HasPrefix(line, "{") {
+		if providerErr := providerOutputError(line); providerErr != nil {
+			if emitErrors {
+				event.Error = providerErr
+				if !emitStreamEvent(ctx, ch, &event) {
+					return false, ctx.Err()
+				}
+			}
+			return false, providerErr
+		}
 		event.Delta = line + "\n"
-		ch <- &event
+		if !emitStreamEvent(ctx, ch, &event) {
+			return false, ctx.Err()
+		}
 		return true, nil
 	}
 	return false, nil
+}
+
+func providerOutputError(text string) error {
+	normalized := strings.ToLower(strings.TrimSpace(text))
+	for _, marker := range []string{
+		"upgrade your plan to continue",
+		"extra usage",
+		"third-party apps",
+		"quota exceeded",
+		"usage limit",
+		"weekly limit",
+		"seven_day",
+		"rate limit",
+		"insufficient credits",
+		"credits exhausted",
+		"authentication required",
+		"unauthorized",
+		"login required",
+	} {
+		if strings.Contains(normalized, marker) {
+			return fmt.Errorf("provider capacity error: %s", marker)
+		}
+	}
+	return nil
+}
+
+func emitStreamEvent(ctx context.Context, ch chan<- *StreamEvent, event *StreamEvent) bool {
+	select {
+	case ch <- event:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func responseText(message map[string]interface{}) string {
@@ -393,18 +732,65 @@ func contentText(value any) string {
 }
 
 func structuredError(message map[string]interface{}) string {
-	for _, key := range []string{"error", "errorMessage", "error_message"} {
-		if value, ok := message[key].(string); ok && strings.TrimSpace(value) != "" {
-			return value
+	return structuredErrorDepth(message, 0)
+}
+
+func structuredProviderError(message map[string]interface{}) error {
+	if rateLimit, ok := message["rate_limit_info"].(map[string]interface{}); ok {
+		if status, _ := rateLimit["status"].(string); strings.EqualFold(strings.TrimSpace(status), "rejected") {
+			return &CapacityError{StatusCode: http.StatusTooManyRequests, RetryAfter: structuredRetryAfter(rateLimit, time.Now())}
 		}
 	}
-	if nested, ok := message["message"].(map[string]interface{}); ok {
-		if value := structuredError(nested); value != "" {
-			return value
+	return fmt.Errorf("provider reported error: %s", structuredError(message))
+}
+
+func structuredRetryAfter(info map[string]interface{}, now time.Time) time.Duration {
+	for _, key := range []string{"retry_after", "retryAfter", "reset_at", "resetAt"} {
+		value, ok := info[key]
+		if !ok {
+			continue
 		}
-		if reason, _ := nested["stopReason"].(string); reason == "error" {
-			return "assistant message stopped with error"
+		switch value := value.(type) {
+		case string:
+			if delay := retryAfter(value, now); delay > 0 {
+				return delay
+			}
+		case float64:
+			if value <= 0 {
+				continue
+			}
+			if strings.Contains(strings.ToLower(key), "reset") && value > float64(now.Unix()) {
+				return boundedRetryAfter(time.Until(time.Unix(int64(value), 0)))
+			}
+			return boundedRetryAfter(time.Duration(value * float64(time.Second)))
 		}
+	}
+	return 0
+}
+
+func structuredErrorDepth(message map[string]interface{}, depth int) string {
+	if depth > 4 {
+		return ""
+	}
+	if rateLimit, ok := message["rate_limit_info"].(map[string]interface{}); ok {
+		if status, _ := rateLimit["status"].(string); strings.EqualFold(strings.TrimSpace(status), "rejected") {
+			return "provider rate limit rejected"
+		}
+	}
+	for _, key := range []string{"error", "errorMessage", "error_message", "message", "detail", "details"} {
+		switch value := message[key].(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				return value
+			}
+		case map[string]interface{}:
+			if nested := structuredErrorDepth(value, depth+1); nested != "" {
+				return nested
+			}
+		}
+	}
+	if reason, _ := message["stopReason"].(string); reason == "error" {
+		return "assistant message stopped with error"
 	}
 	return ""
 }
@@ -437,14 +823,33 @@ func parseToolCalls(message map[string]interface{}) []types.OpenAIToolCall {
 
 func (r *ProviderRunner) GetHealth() *ProviderHealth {
 	r.health.mu.RLock()
-	defer r.health.mu.RUnlock()
-	return &ProviderHealth{
+	health := &ProviderHealth{
 		Status:    r.health.Status,
 		LastCheck: r.health.LastCheck,
 		Latency:   r.health.Latency,
 		Error:     r.health.Error,
 		Available: r.health.Available,
 	}
+	r.health.mu.RUnlock()
+	if !health.Available && r.circuitCanProbe() {
+		health.Available = true
+		health.Status = "half_open"
+	}
+	return health
+}
+
+func (r *ProviderRunner) MarkHealthy(latency time.Duration) {
+	if r == nil || r.health == nil {
+		return
+	}
+	r.health.mu.Lock()
+	r.health.Status = "healthy"
+	r.health.LastCheck = time.Now()
+	r.health.Latency = latency
+	r.health.Error = nil
+	r.health.Available = true
+	r.health.mu.Unlock()
+	r.recordCircuitSuccess()
 }
 
 func (r *ProviderRunner) GetName() string {
@@ -458,6 +863,9 @@ func (r *ProviderRunner) GetModels() []string {
 func (r *ProviderRunner) HealthCheck(ctx context.Context) error {
 	if len(r.prov.Models) == 0 {
 		return fmt.Errorf("provider %s has no configured models", r.prov.Name)
+	}
+	if r.prov.Type == types.ProviderNVIDIA && strings.TrimSpace(r.prov.BaseURL) != "" {
+		return nil
 	}
 	if strings.TrimSpace(r.prov.BaseURL) != "" {
 		return healthCheckHTTP(ctx, r.prov.BaseURL)

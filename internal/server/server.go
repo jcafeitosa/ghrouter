@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,41 +25,58 @@ import (
 	"ghrouter/internal/local_brain"
 	"ghrouter/internal/observability"
 	"ghrouter/internal/providers"
+	"ghrouter/internal/resourcegov"
 	"ghrouter/internal/security"
 	"ghrouter/internal/storage"
 	"ghrouter/internal/types"
 )
 
 type Server struct {
-	cfg        *types.Config
-	providers  map[string]*providers.ProviderRunner
-	catalog    *catalog.Catalog
-	health     *health.Loop
-	mu         sync.RWMutex
-	monitorMu  sync.Mutex
-	monitoring bool
-	verifyMu   sync.Mutex
-	verifyNext map[string]int
-	routeMu    sync.Mutex
-	rrCursor   map[string]int
-	sticky     map[string]stickyRoute
-	httpSrv    *http.Server
-	started    time.Time
-	telemetry  *telemetryState
-	clientKeys security.ClientKeys
-	store      *storage.Store
-	storageErr string
-	configPath string
-	storageMu  sync.RWMutex
-	authMu     sync.Mutex
-	authCache  map[string]authCacheEntry
-	rateMu     sync.Mutex
-	rateWindow map[string]rateWindow
+	cfg              *types.Config
+	providers        map[string]*providers.ProviderRunner
+	catalog          *catalog.Catalog
+	health           *health.Loop
+	mu               sync.RWMutex
+	configMu         sync.RWMutex
+	monitorMu        sync.Mutex
+	monitoring       bool
+	verifyMu         sync.Mutex
+	verifyNext       map[string]int
+	probeMu          sync.Mutex
+	probeFlights     map[string]*modelProbeFlight
+	onDemandMu       sync.Mutex
+	onDemand         map[string]*onDemandVerification
+	routeMu          sync.Mutex
+	rrCursor         map[string]int
+	sticky           map[string]stickyRoute
+	httpSrv          *http.Server
+	started          time.Time
+	telemetry        *telemetryState
+	clientKeys       security.ClientKeys
+	store            *storage.Store
+	storageErr       string
+	configPath       string
+	brainURL         string
+	brainModel       string
+	brainMu          sync.Mutex
+	brainUntil       time.Time
+	brainReady       bool
+	brainAdmission   *resourcegov.Governor
+	bootstrapMu      sync.Mutex
+	bootstrap        local_brain.BootstrapSummary
+	bootstrapAt      time.Time
+	bootstrapRunning bool
+	storageMu        sync.RWMutex
+	authMu           sync.Mutex
+	authCache        map[string]authCacheEntry
+	rateMu           sync.Mutex
+	rateWindow       map[string]rateWindow
 }
 
 type authCacheEntry struct {
 	checkedAt time.Time
 	ready     bool
+	reason    string
 }
 
 type rateWindow struct {
@@ -70,27 +90,54 @@ type stickyRoute struct {
 	expires  time.Time
 }
 
+type onDemandVerification struct {
+	done    chan struct{}
+	success bool
+}
+
+type modelProbeFlight struct {
+	done   chan struct{}
+	result ModelTestResult
+}
+
 type ModelSummary struct {
-	ID            string    `json:"id"`
-	OwnedBy       string    `json:"owned_by"`
-	Provenance    string    `json:"provenance,omitempty"`
-	CostTier      string    `json:"cost_tier,omitempty"`
-	Capabilities  []string  `json:"capabilities,omitempty"`
-	Slots         []string  `json:"slots,omitempty"`
-	Health        string    `json:"health"`
-	LatencyMs     int64     `json:"latency_ms"`
-	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
-	TokenCost     int       `json:"token_cost,omitempty"`
-	MaxTokens     int       `json:"max_tokens,omitempty"`
-	ContextWindow int       `json:"context_window,omitempty"`
-	MaxOutput     int       `json:"max_output,omitempty"`
-	Thinking      bool      `json:"thinking,omitempty"`
-	Vision        bool      `json:"vision,omitempty"`
-	ToolUse       bool      `json:"tool_use,omitempty"`
-	Effort        []string  `json:"effort,omitempty"`
-	CatalogSource string    `json:"catalog_source,omitempty"`
-	List          bool      `json:"list,omitempty"`
-	Members       []string  `json:"members,omitempty"`
+	ID              string    `json:"id"`
+	OwnedBy         string    `json:"owned_by"`
+	Provenance      string    `json:"provenance,omitempty"`
+	CostTier        string    `json:"cost_tier,omitempty"`
+	Capabilities    []string  `json:"capabilities,omitempty"`
+	Classifications []string  `json:"classifications,omitempty"`
+	Slots           []string  `json:"slots,omitempty"`
+	Health          string    `json:"health"`
+	LatencyMs       int64     `json:"latency_ms"`
+	LatencyP95Ms    int64     `json:"latency_p95_ms,omitempty"`
+	CooldownUntil   time.Time `json:"cooldown_until,omitempty"`
+	TokenCost       int       `json:"token_cost,omitempty"`
+	MaxTokens       int       `json:"max_tokens,omitempty"`
+	ContextWindow   int       `json:"context_window,omitempty"`
+	MaxOutput       int       `json:"max_output,omitempty"`
+	Thinking        bool      `json:"thinking,omitempty"`
+	Vision          bool      `json:"vision,omitempty"`
+	ToolUse         bool      `json:"tool_use,omitempty"`
+	Effort          []string  `json:"effort,omitempty"`
+	Kind            string    `json:"kind,omitempty"`
+	Modalities      []string  `json:"modalities,omitempty"`
+	CatalogSource   string    `json:"catalog_source,omitempty"`
+	List            bool      `json:"list,omitempty"`
+	Members         []string  `json:"members,omitempty"`
+}
+
+func (m ModelSummary) MarshalJSON() ([]byte, error) {
+	type modelSummaryAlias ModelSummary
+	var cooldownUntil *time.Time
+	if !m.CooldownUntil.IsZero() {
+		value := m.CooldownUntil
+		cooldownUntil = &value
+	}
+	return json.Marshal(struct {
+		modelSummaryAlias
+		CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	}{modelSummaryAlias: modelSummaryAlias(m), CooldownUntil: cooldownUntil})
 }
 
 type ModelTestResult struct {
@@ -103,6 +150,11 @@ type ModelTestResult struct {
 	LatencyMS     int64     `json:"latency_ms"`
 	CooldownUntil time.Time `json:"cooldown_until,omitempty"`
 }
+
+const (
+	modelProbeMarker  = "ghrouter_model_probe_ok"
+	modelProbeTimeout = 8 * time.Second
+)
 
 type ModelListSummary struct {
 	Name     string   `json:"name"`
@@ -135,15 +187,17 @@ type ComboSummary struct {
 }
 
 type ProviderSnapshot struct {
-	Name      string               `json:"name"`
-	Type      string               `json:"type"`
-	CLIPath   string               `json:"cli_path"`
-	Models    []string             `json:"models"`
-	Available bool                 `json:"available"`
-	Health    string               `json:"health"`
-	Auth      string               `json:"auth"`
-	Account   account.Status       `json:"account"`
-	Discovery types.DiscoveryState `json:"discovery,omitempty"`
+	Name          string                    `json:"name"`
+	Type          string                    `json:"type"`
+	CLIPath       string                    `json:"cli_path"`
+	Models        []string                  `json:"models"`
+	CatalogModels []string                  `json:"catalog_models,omitempty"`
+	Available     bool                      `json:"available"`
+	Health        string                    `json:"health"`
+	Auth          string                    `json:"auth"`
+	Account       account.Status            `json:"account"`
+	Discovery     types.DiscoveryState      `json:"discovery,omitempty"`
+	Harness       types.HarnessCapabilities `json:"harness,omitempty"`
 }
 
 type LiveSnapshot struct {
@@ -159,7 +213,52 @@ type LiveSnapshot struct {
 	Slots       map[string]ModelSummary `json:"slots"`
 	Health      HealthSnapshot          `json:"health"`
 	Telemetry   TelemetrySnapshot       `json:"telemetry"`
+	Graph       RoutingGraphSnapshot    `json:"graph"`
 	Persistence string                  `json:"persistence,omitempty"`
+	Storage     *storage.Stats          `json:"storage,omitempty"`
+}
+
+type RoutingGraphSnapshot struct {
+	Nodes  []RoutingGraphNode   `json:"nodes"`
+	Edges  []RoutingGraphEdge   `json:"edges"`
+	Legend []RoutingGraphLegend `json:"legend"`
+}
+
+type RoutingGraphNode struct {
+	ID             string    `json:"id"`
+	Kind           string    `json:"kind"`
+	Label          string    `json:"label"`
+	Status         string    `json:"status"`
+	Provider       string    `json:"provider,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	CooldownUntil  time.Time `json:"cooldown_until,omitempty"`
+	LatencyMs      int64     `json:"latency_ms,omitempty"`
+	LatencyP95Ms   int64     `json:"latency_p95_ms,omitempty"`
+	LatencySamples int       `json:"latency_samples,omitempty"`
+}
+
+func (n RoutingGraphNode) MarshalJSON() ([]byte, error) {
+	type routingGraphNodeAlias RoutingGraphNode
+	var cooldownUntil *time.Time
+	if !n.CooldownUntil.IsZero() {
+		value := n.CooldownUntil
+		cooldownUntil = &value
+	}
+	return json.Marshal(struct {
+		routingGraphNodeAlias
+		CooldownUntil *time.Time `json:"cooldown_until,omitempty"`
+	}{routingGraphNodeAlias: routingGraphNodeAlias(n), CooldownUntil: cooldownUntil})
+}
+
+type RoutingGraphEdge struct {
+	From     string `json:"from"`
+	To       string `json:"to"`
+	Relation string `json:"relation"`
+}
+
+type RoutingGraphLegend struct {
+	Status string `json:"status"`
+	Color  string `json:"color"`
 }
 
 type LiveResponse struct {
@@ -168,14 +267,23 @@ type LiveResponse struct {
 }
 
 type TelemetrySnapshot struct {
-	Requests      int              `json:"requests"`
-	Successful    int              `json:"successful"`
-	Failed        int              `json:"failed"`
-	Fallbacks     int              `json:"fallbacks"`
-	Active        int              `json:"active"`
-	Recent        []RequestEvent   `json:"recent"`
-	ProviderUsage map[string]int   `json:"provider_usage"`
-	LatencyMs     map[string]int64 `json:"latency_ms"`
+	Requests      int                             `json:"requests"`
+	Successful    int                             `json:"successful"`
+	Failed        int                             `json:"failed"`
+	Fallbacks     int                             `json:"fallbacks"`
+	Active        int                             `json:"active"`
+	Recent        []RequestEvent                  `json:"recent"`
+	ProviderUsage map[string]int                  `json:"provider_usage"`
+	ModelUsage    map[string]int                  `json:"model_usage"`
+	LatencyMs     map[string]int64                `json:"latency_ms"`
+	ModelLatency  map[string]ModelLatencySnapshot `json:"model_latency,omitempty"`
+}
+
+type ModelLatencySnapshot struct {
+	Samples int   `json:"samples"`
+	LastMs  int64 `json:"last_ms"`
+	P50Ms   int64 `json:"p50_ms"`
+	P95Ms   int64 `json:"p95_ms"`
 }
 
 type RequestEvent struct {
@@ -192,6 +300,7 @@ type RequestEvent struct {
 	PromptTokens     int            `json:"prompt_tokens,omitempty"`
 	CompletionTokens int            `json:"completion_tokens,omitempty"`
 	CostMicros       int64          `json:"cost_micros,omitempty"`
+	DecisionJSON     string         `json:"decision_json,omitempty"`
 	Attempts         []AttemptEvent `json:"attempts,omitempty"`
 }
 
@@ -213,22 +322,40 @@ type telemetryState struct {
 	fallbacks     int
 	active        int
 	providerUsage map[string]int
+	modelUsage    map[string]int
 	latencyMs     map[string]int64
+	modelLatency  map[string][]time.Duration
 	recent        []RequestEvent
 	attempts      map[string][]AttemptEvent
 	usage         map[string][2]int
+	decisions     map[string]string
 	costFn        func(provider, model string, tokens int) int64
+	latencyFn     func(provider, model string, latency time.Duration)
 	connectionFn  func(provider, model string) string
 	sink          func(RequestEvent)
 }
 
 type HealthSnapshot struct {
-	Healthy   int                    `json:"healthy"`
-	Degraded  int                    `json:"degraded"`
-	Unhealthy int                    `json:"unhealthy"`
-	Cooldown  int                    `json:"cooldown"`
-	Unknown   int                    `json:"unknown"`
-	Providers map[string]HealthState `json:"providers"`
+	Healthy     int                    `json:"healthy"`
+	Degraded    int                    `json:"degraded"`
+	Unhealthy   int                    `json:"unhealthy"`
+	Cooldown    int                    `json:"cooldown"`
+	CircuitOpen int                    `json:"circuit_open"`
+	Unknown     int                    `json:"unknown"`
+	Providers   map[string]HealthState `json:"providers"`
+	Models      ModelReadiness         `json:"model_readiness"`
+	Resource    resourcegov.Snapshot   `json:"resource"`
+}
+
+type ModelReadiness struct {
+	Catalog         int `json:"catalog"`
+	Verified        int `json:"verified"`
+	VerifiedHealthy int `json:"verified_healthy"`
+	Healthy         int `json:"healthy"`
+	Degraded        int `json:"degraded"`
+	Unhealthy       int `json:"unhealthy"`
+	Cooldown        int `json:"cooldown"`
+	Unknown         int `json:"unknown"`
 }
 
 type HealthState struct {
@@ -238,12 +365,28 @@ type HealthState struct {
 	Timestamp time.Time     `json:"timestamp"`
 }
 
+func (s HealthState) MarshalJSON() ([]byte, error) {
+	type healthStateJSON struct {
+		Status    string        `json:"status"`
+		Latency   time.Duration `json:"latency"`
+		Error     string        `json:"error,omitempty"`
+		Timestamp *time.Time    `json:"timestamp,omitempty"`
+	}
+	var timestamp *time.Time
+	if !s.Timestamp.IsZero() {
+		value := s.Timestamp
+		timestamp = &value
+	}
+	return json.Marshal(healthStateJSON{Status: s.Status, Latency: s.Latency, Error: s.Error, Timestamp: timestamp})
+}
+
 type HealthResponse struct {
 	Status        string         `json:"status"`
 	Uptime        time.Duration  `json:"uptime"`
 	Health        HealthSnapshot `json:"health"`
 	ProviderCount int            `json:"provider_count"`
 	ModelCount    int            `json:"model_count"`
+	BinarySHA256  string         `json:"binary_sha256,omitempty"`
 }
 
 func requestID(r *http.Request) string {
@@ -261,26 +404,97 @@ func requestClient(r *http.Request) string {
 	return value
 }
 
+func setRoutingHeaders(w http.ResponseWriter, rid, requested, provider, model, stage string, candidates int, reasons ...string) {
+	if w == nil {
+		return
+	}
+	w.Header().Set("X-Ghrouter-Request-ID", strings.TrimSpace(rid))
+	if requested = strings.TrimSpace(requested); requested != "" {
+		w.Header().Set("X-Ghrouter-Requested-Model", requested)
+	}
+	if provider = strings.TrimSpace(provider); provider != "" {
+		w.Header().Set("X-Ghrouter-Provider", provider)
+	}
+	if model = strings.TrimSpace(model); model != "" {
+		w.Header().Set("X-Ghrouter-Model", model)
+	}
+	if stage = strings.TrimSpace(stage); stage != "" {
+		w.Header().Set("X-Ghrouter-Selection-Stage", stage)
+	}
+	if len(reasons) > 0 {
+		if reason := strings.TrimSpace(reasons[0]); reason != "" {
+			w.Header().Set("X-Ghrouter-Selection-Reason", reason)
+		}
+	}
+	if candidates >= 0 {
+		w.Header().Set("X-Ghrouter-Candidate-Count", strconv.Itoa(candidates))
+	}
+}
+
 func (s *Server) RouteOpenAIRequest(req *types.OpenAIRequest) (provider string, model string) {
 	if req == nil {
 		return "", ""
 	}
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 
 	if req.Model != "" {
-		if provider, model = s.routeByModelName(req.Model, req.SessionID); provider != "" {
+		if provider, model = s.routeByModelName(req.Model, req.SessionID, req); provider != "" {
 			return provider, model
 		}
 	}
 
-	if model := s.catalog.BestHealthyModelForSlot(slotForRequest(req)); model != nil {
+	if model := s.bestPolicyModelForRequest(req); model != nil {
 		return model.Provider, model.Model
 	}
 
+	if s.hasModelPolicy() {
+		return "", ""
+	}
 	if model := s.catalog.BestHealthyModel(); model != nil {
+		if model.Provider == "local-brain" && !s.brainReadyForSelection() {
+			return "", ""
+		}
 		return model.Provider, model.Model
 	}
 
 	return "", ""
+}
+
+func (s *Server) bestPolicyModelForRequest(req *types.OpenAIRequest) *catalog.ModelEntry {
+	if s == nil || s.catalog == nil || s.cfg == nil {
+		return nil
+	}
+	profile := ProfileRequest(req)
+	slot := slotForRequest(req)
+	candidates := prioritizeModelCandidates(s.policyCandidates(req), profile, slot)
+	if selected := s.selectWithLocalBrain(req, candidates); selected != nil {
+		if req != nil {
+			req.SelectionStage = "local_brain"
+		}
+		return selected
+	}
+	selected := bestScoredCandidate(s, candidates, req)
+	if req != nil && selected != nil {
+		if selected.Provider == "local-brain" {
+			req.SelectionStage = "local_brain"
+			if req.SelectionReason == "" {
+				req.SelectionReason = "local brain deterministic fallback"
+			}
+		} else {
+			req.SelectionStage = "deterministic_score"
+			req.SelectionReason = "health, capability, policy, quota and latency score"
+		}
+	}
+	return selected
+}
+
+func (s *Server) hasModelPolicy() bool {
+	if s == nil || s.cfg == nil {
+		return false
+	}
+	policy := s.cfg.ModelPolicy
+	return len(policy.Allowed) > 0 || len(policy.Preferred) > 0 || len(policy.Excluded) > 0
 }
 
 func New(cfg *types.Config) *Server {
@@ -291,10 +505,118 @@ func NewWithConfigPath(cfg *types.Config, configPath string) *Server {
 	return newServer(cfg, configPath)
 }
 
+func (s *Server) AttachProvider(provider *types.Provider) error {
+	if s == nil || provider == nil || strings.TrimSpace(provider.Name) == "" {
+		return fmt.Errorf("provider attachment requires a named provider")
+	}
+	if !provider.Enabled {
+		return fmt.Errorf("provider %s is disabled", provider.Name)
+	}
+	runner := providers.NewProviderRunner(provider)
+	runner.SetCircuitPolicy(providers.CircuitPolicy{
+		Enabled:          s.cfg.Circuit.IsEnabled(),
+		FailureThreshold: s.cfg.Circuit.FailureThreshold,
+		OpenDuration:     s.cfg.Circuit.OpenDuration,
+	})
+	models := buildCatalogModels(provider)
+	verifiedModels := 0
+	for _, model := range provider.Models {
+		if info, ok := modelInfoForProvider(provider, model); ok && !info.VerifiedAt.IsZero() && info.VerificationError == "" && strings.EqualFold(info.HealthStatus, "healthy") {
+			verifiedModels++
+		}
+	}
+	observability.Logger("server").Info("provider_attach_requested", "provider", provider.Name, "models", len(provider.Models), "verified_models", verifiedModels)
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
+	s.mu.Lock()
+	existing, runnerExists := s.providers[provider.Name]
+	configuredIndex := -1
+	for index, configured := range s.cfg.Providers {
+		if configured != nil && configured.Name == provider.Name {
+			configuredIndex = index
+			break
+		}
+	}
+	if runnerExists || (provider.Name == "local-brain" && configuredIndex >= 0) {
+		if provider.Name != "local-brain" {
+			s.mu.Unlock()
+			runner.Close()
+			return fmt.Errorf("provider %s is already attached", provider.Name)
+		}
+		if configuredIndex >= 0 {
+			s.cfg.Providers[configuredIndex] = provider
+		} else {
+			s.cfg.Providers = append(s.cfg.Providers, provider)
+		}
+		if provider.Type == types.ProviderLocal && strings.TrimSpace(provider.BaseURL) != "" && len(provider.Models) > 0 {
+			s.brainURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+			s.brainModel = provider.Models[0]
+		}
+		s.providers[provider.Name] = runner
+		s.cfg.ModelLists = detectors.BuildAutomaticModelLists(s.cfg.Providers, s.cfg.ModelLists)
+		s.mu.Unlock()
+		if s.health != nil {
+			s.health.Unregister(provider.Name)
+			s.health.Register(runner)
+			if provider.Type == types.ProviderLocal && verifiedModels > 0 {
+				s.health.RecordSuccess(provider.Name, 0)
+			}
+		}
+		if provider.Type == types.ProviderLocal && verifiedModels > 0 {
+			runner.MarkHealthy(0)
+		}
+		if s.catalog != nil {
+			s.catalog.RegisterProvider(provider.Name, models)
+		}
+		if provider.Type == types.ProviderLocal {
+			s.setBrainReady()
+		}
+		if runnerExists {
+			existing.Close()
+		}
+		return nil
+	}
+	s.providers[provider.Name] = runner
+	s.cfg.Providers = append(s.cfg.Providers, provider)
+	if provider.Type == types.ProviderLocal && strings.TrimSpace(provider.BaseURL) != "" && len(provider.Models) > 0 {
+		s.brainURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+		s.brainModel = provider.Models[0]
+	}
+	s.cfg.ModelLists = detectors.BuildAutomaticModelLists(s.cfg.Providers, s.cfg.ModelLists)
+	s.mu.Unlock()
+	if s.health != nil {
+		s.health.Register(runner)
+		if provider.Type == types.ProviderLocal && verifiedModels > 0 {
+			s.health.RecordSuccess(provider.Name, 0)
+		}
+	}
+	if provider.Type == types.ProviderLocal && verifiedModels > 0 {
+		runner.MarkHealthy(0)
+	}
+	if s.catalog != nil {
+		s.catalog.RegisterProvider(provider.Name, models)
+	}
+	if provider.Type == types.ProviderLocal {
+		s.setBrainReady()
+	}
+	if status := account.Load(provider); status.ResetAt.After(time.Now()) && (account.Blocked(status) || (status.Balance != nil && *status.Balance <= 0)) {
+		s.catalog.RecordProviderFailure(provider.Name, time.Now(), status.ResetAt)
+	}
+	return nil
+}
+
 func newServer(cfg *types.Config, configPath string) *Server {
 	normalizeConfiguredProviders(cfg)
 	cfg.ModelLists = detectors.BuildAutomaticModelLists(cfg.Providers, cfg.ModelLists)
-	s := &Server{cfg: cfg, configPath: configPath, providers: make(map[string]*providers.ProviderRunner), rrCursor: make(map[string]int), sticky: make(map[string]stickyRoute), started: time.Now(), telemetry: newTelemetryState(), authCache: make(map[string]authCacheEntry), rateWindow: make(map[string]rateWindow), verifyNext: make(map[string]int)}
+	s := &Server{cfg: cfg, configPath: configPath, providers: make(map[string]*providers.ProviderRunner), rrCursor: make(map[string]int), sticky: make(map[string]stickyRoute), started: time.Now(), telemetry: newTelemetryState(), authCache: make(map[string]authCacheEntry), rateWindow: make(map[string]rateWindow), verifyNext: make(map[string]int), onDemand: make(map[string]*onDemandVerification), probeFlights: make(map[string]*modelProbeFlight), brainReady: configPath == "", brainAdmission: resourcegov.New(resourcegov.Config{BrainMaxInFlight: 1}, resourcegov.NewSystemSampler(), nil)}
+	for _, provider := range cfg.Providers {
+		if provider == nil || provider.Type != types.ProviderLocal || strings.TrimSpace(provider.BaseURL) == "" || len(provider.Models) == 0 {
+			continue
+		}
+		s.brainURL = strings.TrimRight(strings.TrimSpace(provider.BaseURL), "/")
+		s.brainModel = provider.Models[0]
+		break
+	}
 	healthInterval := cfg.Health.Interval
 	if healthInterval <= 0 {
 		healthInterval = 30 * time.Second
@@ -326,12 +648,20 @@ func newServer(cfg *types.Config, configPath string) *Server {
 		return int64((tokens+999)/1000) * int64(entry.TokenCost)
 	}
 	s.telemetry.connectionFn = s.connectionFor
+	s.telemetry.latencyFn = func(provider, model string, latency time.Duration) {
+		s.catalog.RecordLatency(canonicalModelID(provider, model), latency)
+	}
 	for _, p := range cfg.Providers {
 		if p.Enabled && (strings.TrimSpace(p.CLIPath) != "" || strings.TrimSpace(p.BaseURL) != "" || len(p.Models) > 0 || p.Type == "" || p.Type == types.ProviderCustom) {
 			runner := providers.NewProviderRunner(p)
+			runner.SetCircuitPolicy(providers.CircuitPolicy{
+				Enabled:          cfg.Circuit.IsEnabled(),
+				FailureThreshold: cfg.Circuit.FailureThreshold,
+				OpenDuration:     cfg.Circuit.OpenDuration,
+			})
 			s.providers[p.Name] = runner
 			s.health.Register(runner)
-			s.catalog.RegisterProvider(p.Name, buildCatalogModels(p))
+			s.catalog.RegisterProvider(p.Name, s.catalogModels(p))
 			status := account.Load(p)
 			if status.ResetAt.After(time.Now()) && (account.Blocked(status) || (status.Balance != nil && *status.Balance <= 0)) {
 				s.catalog.RecordProviderFailure(p.Name, time.Now(), status.ResetAt)
@@ -344,9 +674,12 @@ func newServer(cfg *types.Config, configPath string) *Server {
 func newTelemetryState() *telemetryState {
 	return &telemetryState{
 		providerUsage: make(map[string]int),
+		modelUsage:    make(map[string]int),
 		latencyMs:     make(map[string]int64),
+		modelLatency:  make(map[string][]time.Duration),
 		attempts:      make(map[string][]AttemptEvent),
 		usage:         make(map[string][2]int),
+		decisions:     make(map[string]string),
 	}
 }
 
@@ -354,10 +687,6 @@ func (t *telemetryState) setSink(sink func(RequestEvent)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.sink = sink
-}
-
-func (t *telemetryState) begin() func(status string, fallback bool, provider, model, endpoint string, latency time.Duration) {
-	return t.beginWithMeta("", "")
 }
 
 func (t *telemetryState) beginWithMeta(id, client string) func(status string, fallback bool, provider, model, endpoint string, latency time.Duration) {
@@ -385,23 +714,38 @@ func (t *telemetryState) beginWithMeta(id, client string) func(status string, fa
 		if provider != "" {
 			t.providerUsage[provider]++
 		}
+		if modelKey := canonicalModelID(provider, model); modelKey != "" {
+			t.modelUsage[modelKey]++
+		}
 		if provider != "" {
 			t.latencyMs[provider] = int64(latency / time.Millisecond)
 		}
+		modelKey := canonicalModelID(provider, model)
+		if modelKey != "" && latency > 0 {
+			t.modelLatency[modelKey] = append(t.modelLatency[modelKey], latency)
+			if len(t.modelLatency[modelKey]) > 128 {
+				t.modelLatency[modelKey] = t.modelLatency[modelKey][len(t.modelLatency[modelKey])-128:]
+			}
+		}
+		if t.latencyFn != nil {
+			t.latencyFn(provider, model, latency)
+		}
 		event = RequestEvent{
 			RequestID: id, Client: client, At: time.Now(),
-			Endpoint: endpoint,
-			Provider: provider,
-			Model:    model,
-			Status:   status,
-			Fallback: fallback,
-			Latency:  latency,
+			Endpoint:     endpoint,
+			Provider:     provider,
+			Model:        model,
+			Status:       status,
+			Fallback:     fallback,
+			Latency:      latency,
+			DecisionJSON: t.decisions[id],
 		}
 		if t.connectionFn != nil {
 			event.ConnectionID = t.connectionFn(provider, model)
 		}
 		event.Attempts = append([]AttemptEvent(nil), t.attempts[id]...)
 		delete(t.attempts, id)
+		delete(t.decisions, id)
 		if usage, ok := t.usage[id]; ok {
 			event.PromptTokens = usage[0]
 			event.CompletionTokens = usage[1]
@@ -419,6 +763,58 @@ func (t *telemetryState) beginWithMeta(id, client string) func(status string, fa
 		if sink != nil {
 			sink(event)
 		}
+	}
+}
+
+func (t *telemetryState) recordDecision(id string, profile RequestProfile) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	decision := struct {
+		Intent           RequestIntent   `json:"intent"`
+		Complexity       TaskComplexity  `json:"complexity"`
+		Modality         RequestModality `json:"modality"`
+		NeedsTools       bool            `json:"needs_tools"`
+		NeedsVision      bool            `json:"needs_vision"`
+		NeedsLongContext bool            `json:"needs_long_context"`
+		ReasoningEffort  string          `json:"reasoning_effort,omitempty"`
+		CostClass        CostClass       `json:"cost_class"`
+		Graph            TaskGraph       `json:"graph"`
+	}{profile.Intent, profile.Complexity, profile.Modality, profile.NeedsTools, profile.NeedsVision, profile.NeedsLongContext, profile.ReasoningEffort, profile.CostClass, profile.Graph}
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	t.decisions[id] = string(payload)
+	t.mu.Unlock()
+}
+
+func (t *telemetryState) recordSelection(id, provider, model, stage string, reasons ...string) {
+	if strings.TrimSpace(id) == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	decision := make(map[string]any)
+	if raw := strings.TrimSpace(t.decisions[id]); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &decision)
+	}
+	if provider != "" && model != "" {
+		decision["selected"] = canonicalModelID(provider, model)
+		if stage == "" {
+			stage = "route"
+		}
+		decision["selection_stage"] = stage
+		if len(reasons) > 0 && strings.TrimSpace(reasons[0]) != "" {
+			decision["selection_reason"] = strings.TrimSpace(reasons[0])
+		}
+	} else {
+		decision["selected"] = nil
+		decision["selection_stage"] = "unrouted"
+	}
+	if payload, err := json.Marshal(decision); err == nil {
+		t.decisions[id] = string(payload)
 	}
 }
 
@@ -453,9 +849,31 @@ func (t *telemetryState) snapshot() TelemetrySnapshot {
 	for k, v := range t.providerUsage {
 		usage[k] = v
 	}
+	modelUsage := make(map[string]int, len(t.modelUsage))
+	for k, v := range t.modelUsage {
+		modelUsage[k] = v
+	}
 	latency := make(map[string]int64, len(t.latencyMs))
 	for k, v := range t.latencyMs {
 		latency[k] = v
+	}
+	modelLatency := make(map[string]ModelLatencySnapshot, len(t.modelLatency))
+	for model, samples := range t.modelLatency {
+		if len(samples) == 0 {
+			continue
+		}
+		sorted := append([]time.Duration(nil), samples...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		p95Index := int(float64(len(sorted)) * 0.95)
+		if p95Index >= len(sorted) {
+			p95Index = len(sorted) - 1
+		}
+		modelLatency[model] = ModelLatencySnapshot{
+			Samples: len(sorted),
+			LastMs:  samples[len(samples)-1].Milliseconds(),
+			P50Ms:   sorted[(len(sorted)-1)/2].Milliseconds(),
+			P95Ms:   sorted[p95Index].Milliseconds(),
+		}
 	}
 	return TelemetrySnapshot{
 		Requests:      t.requests,
@@ -465,7 +883,9 @@ func (t *telemetryState) snapshot() TelemetrySnapshot {
 		Active:        t.active,
 		Recent:        recent,
 		ProviderUsage: usage,
+		ModelUsage:    modelUsage,
 		LatencyMs:     latency,
+		ModelLatency:  modelLatency,
 	}
 }
 
@@ -480,6 +900,9 @@ func (s *Server) StartMonitoring(ctx context.Context) {
 	if s.health != nil && s.cfg.Health.IsEnabled() {
 		s.health.Start(ctx)
 	}
+	if s.brainAdmission != nil {
+		go s.observeResourcePressure(ctx)
+	}
 	if s.catalog != nil {
 		s.catalog.Start(ctx)
 	}
@@ -488,16 +911,36 @@ func (s *Server) StartMonitoring(ctx context.Context) {
 	}
 }
 
-func (s *Server) autoBootstrapEnabled() bool {
-	if s == nil || s.configPath == "" || s.cfg == nil || s.cfg.Verification.Enabled != nil {
-		return false
+func (s *Server) observeResourcePressure(ctx context.Context) {
+	if s == nil || s.brainAdmission == nil {
+		return
 	}
-	for _, list := range s.cfg.ModelLists {
-		if strings.EqualFold(list.Name, "ghrouter/auto") {
-			return true
+	observe := func() {
+		observeCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+		state, err := s.brainAdmission.Observe(observeCtx)
+		cancel()
+		log := observability.Logger("resource")
+		if err != nil {
+			log.Debug("resource_sample_unavailable", "error_type", observability.ErrorType(err))
+			return
+		}
+		log.Debug("resource_state_observed", "state", state)
+	}
+	observe()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			observe()
 		}
 	}
-	return false
+}
+
+func (s *Server) autoBootstrapEnabled() bool {
+	return s != nil && s.configPath != "" && s.cfg != nil && s.cfg.Verification.IsEnabled() && s.cfg.Verification.Startup
 }
 
 func (s *Server) bootstrapAutomaticModels(ctx context.Context) {
@@ -652,6 +1095,7 @@ func (s *Server) applyModelVerification(results []ModelTestResult, verifiedAt ti
 		if result.Provider == "" || result.Model == "" || result.Status == "cooldown" {
 			continue
 		}
+		providerCapacityFailure := result.Status == "failed" && result.Error == "provider capacity limit reached"
 		for _, provider := range s.cfg.Providers {
 			if provider == nil || provider.Name != result.Provider {
 				continue
@@ -659,13 +1103,45 @@ func (s *Server) applyModelVerification(results []ModelTestResult, verifiedAt ti
 			if provider.ModelInfo == nil {
 				provider.ModelInfo = make(map[string]types.ModelInfo)
 			}
-			info := provider.ModelInfo[result.Model]
-			info.Model = result.Model
-			info.HealthStatus = result.Status
-			info.CooldownUntil = result.CooldownUntil
-			info.VerifiedAt = verifiedAt
-			info.VerificationError = result.Error
-			provider.ModelInfo[result.Model] = info
+			models := []string{result.Model}
+			if providerCapacityFailure {
+				models = provider.Models
+			}
+			for _, model := range models {
+				model = strings.TrimSpace(model)
+				if model == "" {
+					continue
+				}
+				if result.Status == "healthy" {
+					known := false
+					for _, configured := range provider.Models {
+						if canonicalModelID(provider.Name, configured) == canonicalModelID(provider.Name, model) {
+							known = true
+							break
+						}
+					}
+					if !known {
+						provider.Models = append(provider.Models, model)
+					}
+				}
+				key := modelInfoKeyForProvider(provider, model)
+				if key == "" {
+					key = model
+				}
+				info := provider.ModelInfo[key]
+				info.Model = model
+				info.HealthStatus = result.Status
+				if result.CooldownUntil.After(info.CooldownUntil) {
+					info.CooldownUntil = result.CooldownUntil
+				}
+				if result.Status == "healthy" {
+					info.VerifiedAt = verifiedAt
+					info.VerificationError = ""
+				} else if strings.TrimSpace(result.Error) != "" {
+					info.VerificationError = result.Error
+				}
+				provider.ModelInfo[key] = info
+			}
 		}
 	}
 	normalizeConfiguredProviders(s.cfg)
@@ -757,6 +1233,8 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 	if s == nil || next == nil {
 		return fmt.Errorf("reload requires a configuration")
 	}
+	s.configMu.Lock()
+	defer s.configMu.Unlock()
 	if next.ListenPort != 0 && s.cfg.ListenPort != 0 && next.ListenPort != s.cfg.ListenPort {
 		return fmt.Errorf("listen port change requires restart")
 	}
@@ -783,6 +1261,23 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 	}
 	normalizeConfiguredProviders(next)
 	next.ModelLists = detectors.BuildAutomaticModelLists(next.Providers, next.ModelLists)
+	s.mu.Lock()
+	for _, provider := range next.Providers {
+		for _, current := range s.cfg.Providers {
+			if current != nil && current.Name == provider.Name {
+				current.AuthConfig = provider.AuthConfig
+				current.Accounts = append([]types.ProviderCredential(nil), provider.Accounts...)
+				current.Account = provider.Account
+				current.Enabled = provider.Enabled
+				current.Models = append([]string(nil), provider.Models...)
+				current.ModelInfo = cloneModelInfoMap(provider.ModelInfo)
+			}
+		}
+	}
+	s.mu.Unlock()
+	if err := s.refreshRuntimeCatalog(next); err != nil {
+		return err
+	}
 	healthInterval := next.Health.Interval
 	if healthInterval <= 0 {
 		healthInterval = 30 * time.Second
@@ -805,6 +1300,13 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 	if s.catalog != nil {
 		s.catalog.SetCooldownPolicy(next.Cooldown.IsEnabled(), cooldownDefault, cooldownMax)
 	}
+	for _, runner := range s.providers {
+		runner.SetCircuitPolicy(providers.CircuitPolicy{
+			Enabled:          next.Circuit.IsEnabled(),
+			FailureThreshold: next.Circuit.FailureThreshold,
+			OpenDuration:     next.Circuit.OpenDuration,
+		})
+	}
 	s.mu.Lock()
 	s.cfg.Routes = next.Routes
 	s.cfg.ModelLists = next.ModelLists
@@ -815,30 +1317,8 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 	s.cfg.RateLimit = next.RateLimit
 	s.cfg.Health = next.Health
 	s.cfg.Cooldown = next.Cooldown
-	for _, provider := range next.Providers {
-		for _, current := range s.cfg.Providers {
-			if current != nil && current.Name == provider.Name {
-				current.AuthConfig = provider.AuthConfig
-				current.Account = provider.Account
-				current.Enabled = provider.Enabled
-				current.Models = append([]string(nil), provider.Models...)
-				current.ModelInfo = cloneModelInfoMap(provider.ModelInfo)
-			}
-		}
-	}
+	s.cfg.Circuit = next.Circuit
 	s.mu.Unlock()
-	if s.catalog != nil {
-		for _, provider := range s.cfg.Providers {
-			if provider == nil {
-				continue
-			}
-			if !provider.Enabled {
-				s.catalog.UnregisterProvider(provider.Name)
-				continue
-			}
-			s.catalog.RegisterProvider(provider.Name, buildCatalogModels(provider))
-		}
-	}
 	if store := s.getStore(); store != nil {
 		if err := s.persistStorageState(); err != nil {
 			return fmt.Errorf("persist reloaded configuration: %w", err)
@@ -847,11 +1327,50 @@ func (s *Server) ReloadConfig(next *types.Config) error {
 	return nil
 }
 
+func (s *Server) refreshRuntimeCatalog(cfg *types.Config) error {
+	if s == nil || cfg == nil {
+		return fmt.Errorf("runtime catalog refresh requires configuration")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, provider := range cfg.Providers {
+		if provider == nil {
+			continue
+		}
+		if !provider.Enabled {
+			if s.catalog != nil {
+				s.catalog.UnregisterProvider(provider.Name)
+			}
+			continue
+		}
+		if s.catalog != nil {
+			s.catalog.RegisterProvider(provider.Name, s.catalogModels(provider))
+		}
+	}
+	return nil
+}
+
+func (s *Server) catalogModels(provider *types.Provider) []*catalog.ModelEntry {
+	models := buildCatalogModels(provider)
+	if s == nil || s.configPath == "" {
+		return models
+	}
+	for _, model := range models {
+		if model == nil || model.HealthStatus != health.HealthHealthy || s.modelVerified(provider.Name, model.Model) {
+			continue
+		}
+		model.HealthStatus = health.HealthUnknown
+		model.LastHealthCheck = time.Time{}
+	}
+	return models
+}
+
 func normalizeConfiguredProviders(cfg *types.Config) {
 	if cfg == nil {
 		return
 	}
 	for _, provider := range cfg.Providers {
+		providers.NormalizeNVIDIAProvider(provider)
 		detectors.EnrichProviderModels(provider)
 	}
 }
@@ -909,18 +1428,6 @@ func (s *Server) connectionFor(provider, model string) string {
 	return ""
 }
 
-func sameStrings(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for i := range left {
-		if left[i] != right[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func (s *Server) ListenAndServe(ctx context.Context) error {
 	log := observability.Logger("server")
 	s.StartMonitoring(ctx)
@@ -942,7 +1449,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 					Status: event.Status, Fallback: event.Fallback,
 					LatencyMS: event.Latency.Milliseconds(), At: event.At,
 					PromptTokens: event.PromptTokens, CompletionTokens: event.CompletionTokens,
-					CostMicros: event.CostMicros,
+					CostMicros: event.CostMicros, DecisionJSON: event.DecisionJSON,
 					Attempts: func() []storage.AttemptEvent {
 						attempts := make([]storage.AttemptEvent, 0, len(event.Attempts))
 						for _, attempt := range event.Attempts {
@@ -1007,7 +1514,12 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err := validateBindHost(host, s.cfg.ACL.Enabled); err != nil {
 		return err
 	}
-	listener, actualPort, cleanup, err := openListenerOnHost(host, port)
+	defer func() {
+		for _, runner := range s.providers {
+			runner.Close()
+		}
+	}()
+	listener, actualPort, cleanup, err := openListenerOnHostWithConfig(host, port, s.configPath)
 	if err != nil {
 		log.Error("listener_failed", "error", observability.PublicError(err), "port", port)
 		return err
@@ -1042,19 +1554,37 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if idleTimeout <= 0 {
 		idleTimeout = 60 * time.Second
 	}
-	s.httpSrv = &http.Server{Addr: listener.Addr().String(), Handler: handler, ReadTimeout: readTimeout, WriteTimeout: writeTimeout, IdleTimeout: idleTimeout}
+	s.httpSrv = &http.Server{
+		Addr:         listener.Addr().String(),
+		Handler:      handler,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
+		BaseContext:  func(net.Listener) context.Context { return ctx },
+	}
 	if s.autoBootstrapEnabled() {
 		go s.bootstrapAutomaticModels(ctx)
 	}
 
+	shutdownDone := make(chan error, 1)
+	shutdownStop := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		s.httpSrv.Shutdown(shutdownCtx)
+		select {
+		case <-ctx.Done():
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			shutdownDone <- s.httpSrv.Shutdown(shutdownCtx)
+		case <-shutdownStop:
+		}
 	}()
 
 	err = s.httpSrv.Serve(listener)
+	if ctx.Err() != nil {
+		if shutdownErr := <-shutdownDone; shutdownErr != nil {
+			log.Warn("server_shutdown_incomplete", "error", observability.PublicError(shutdownErr))
+		}
+	}
+	close(shutdownStop)
 	if err != nil && !strings.Contains(err.Error(), "Server closed") {
 		log.Error("server_stopped_with_error", "error", observability.PublicError(err))
 	}
@@ -1100,6 +1630,8 @@ func (s *Server) allowRequest(r *http.Request) bool {
 }
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	telemetry := s.telemetry.snapshot()
 	fmt.Fprintf(w, "# HELP ghrouter_requests_total Total requests handled by Ghrouter.\n# TYPE ghrouter_requests_total counter\nghrouter_requests_total %d\n", telemetry.Requests)
@@ -1127,6 +1659,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	sort.Strings(latencyProviders)
 	for _, provider := range latencyProviders {
 		fmt.Fprintf(w, "ghrouter_provider_latency_ms{provider=\"%s\"} %d\n", escapePromLabel(provider), telemetry.LatencyMs[provider])
+	}
+	fmt.Fprintln(w, "# HELP ghrouter_provider_circuit_open Provider circuit state, one when open.")
+	fmt.Fprintln(w, "# TYPE ghrouter_provider_circuit_open gauge")
+	for _, provider := range s.cfg.Providers {
+		if provider == nil || !provider.Enabled {
+			continue
+		}
+		open := 0
+		if runner := s.providers[provider.Name]; runner != nil && runner.GetHealth().Status == "circuit_open" {
+			open = 1
+		}
+		fmt.Fprintf(w, "ghrouter_provider_circuit_open{provider=\"%s\"} %d\n", escapePromLabel(provider.Name), open)
 	}
 
 	models := s.catalog.GetAllModels()
@@ -1188,6 +1732,165 @@ func escapePromLabel(value string) string {
 	return strings.ReplaceAll(value, "\n", `\n`)
 }
 
+const (
+	onDemandVerificationLimit   = 3
+	onDemandVerificationTimeout = 20 * time.Second
+)
+
+func isVirtualModelRequest(requested string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(requested)), "ghrouter/")
+}
+
+func (s *Server) verifyVirtualRouteOnDemand(ctx context.Context, requested string, req *types.OpenAIRequest) bool {
+	if s == nil || ctx == nil || !isVirtualModelRequest(requested) || s.configPath == "" || s.cfg == nil {
+		return false
+	}
+	if s.cfg.Verification.Enabled != nil && !*s.cfg.Verification.Enabled {
+		return false
+	}
+	targets := s.onDemandVerificationTargets(requested, req)
+	if len(targets) == 0 {
+		return false
+	}
+	key := strings.ToLower(strings.TrimSpace(requested))
+	s.onDemandMu.Lock()
+	if existing := s.onDemand[key]; existing != nil {
+		done := existing.done
+		s.onDemandMu.Unlock()
+		select {
+		case <-done:
+			s.onDemandMu.Lock()
+			success := existing.success
+			s.onDemandMu.Unlock()
+			return success
+		case <-ctx.Done():
+			return false
+		}
+	}
+	flight := &onDemandVerification{done: make(chan struct{})}
+	s.onDemand[key] = flight
+	s.onDemandMu.Unlock()
+
+	defer func() {
+		s.onDemandMu.Lock()
+		close(flight.done)
+		delete(s.onDemand, key)
+		s.onDemandMu.Unlock()
+	}()
+
+	timeout := onDemandVerificationTimeout
+	if configured := s.cfg.Verification.Timeout; configured > 0 && configured < timeout {
+		timeout = configured
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	results := make([]ModelTestResult, 0, len(targets))
+	for _, target := range targets {
+		if probeCtx.Err() != nil {
+			break
+		}
+		results = append(results, s.TestModel(probeCtx, target))
+	}
+	if len(results) > 0 {
+		s.applyModelVerification(results, time.Now().UTC())
+	}
+	success := false
+	for _, result := range results {
+		if result.Status == "healthy" {
+			success = true
+			break
+		}
+	}
+	s.onDemandMu.Lock()
+	flight.success = success
+	s.onDemandMu.Unlock()
+	return success
+}
+
+func (s *Server) onDemandVerificationTargets(requested string, req *types.OpenAIRequest) []string {
+	if s == nil || s.catalog == nil {
+		return nil
+	}
+	references := make([]string, 0)
+	isAutomatic := false
+	for _, list := range s.cfg.ModelLists {
+		if strings.EqualFold(list.Name, requested) {
+			references = append(references, list.Models...)
+			isAutomatic = strings.EqualFold(list.Kind, "automatic")
+			break
+		}
+	}
+	if (len(references) == 0 || isAutomatic) && strings.EqualFold(requested, "ghrouter/auto") {
+		for _, entry := range s.catalog.GetAllModels() {
+			if entry != nil {
+				references = append(references, entry.ID)
+			}
+		}
+	}
+	type target struct {
+		id    string
+		score float64
+	}
+	targets := make([]target, 0, len(references))
+	seen := make(map[string]bool)
+	for _, reference := range references {
+		for _, leaf := range s.expandModelReferences(reference, make(map[string]bool)) {
+			provider, model := s.resolveModelReference(leaf)
+			if provider == "" || model == "" {
+				continue
+			}
+			id := canonicalModelID(provider, model)
+			if seen[id] || s.modelVerified(provider, model) || !s.providerIsActive(provider) || !s.providerHealthy(provider) || !s.modelPolicyAllows(provider, model) || s.catalog.IsInCooldown(id) {
+				continue
+			}
+			if s.getProvider(provider) == nil {
+				continue
+			}
+			seen[id] = true
+			score := 0.0
+			if entry := s.catalog.GetModel(id); entry != nil {
+				score = s.requestModelScore(provider, model, req)
+			}
+			targets = append(targets, target{id: id, score: score})
+		}
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if targets[i].score == targets[j].score {
+			return targets[i].id < targets[j].id
+		}
+		return targets[i].score > targets[j].score
+	})
+	if len(targets) > onDemandVerificationLimit {
+		targets = targets[:onDemandVerificationLimit]
+	}
+	result := make([]string, 0, len(targets))
+	for _, candidate := range targets {
+		result = append(result, candidate.id)
+	}
+	return result
+}
+
+func (s *Server) extendVirtualCandidatesAfterFailure(ctx context.Context, requested string, req *types.OpenAIRequest, current []routeCandidate) []routeCandidate {
+	if s == nil || req == nil || !isVirtualModelRequest(requested) || !s.verifyVirtualRouteOnDemand(ctx, requested, req) {
+		return current
+	}
+	provider, model := s.RouteOpenAIRequest(req)
+	extra := s.routeCandidates(requested, provider, model, req)
+	for _, candidate := range extra {
+		duplicate := false
+		for _, existing := range current {
+			if existing.provider == candidate.provider && existing.model == candidate.model {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			current = append(current, candidate)
+		}
+	}
+	return current
+}
+
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1202,12 +1905,25 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		end("error", false, "", req.Model, "/v1/chat/completions", time.Since(start))
 		return
 	}
+	if len(req.Messages) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "messages must contain at least one item")
+		end("error", false, "", req.Model, "/v1/chat/completions", time.Since(start))
+		return
+	}
 	req.RequestID = rid
 	req.SessionID = strings.TrimSpace(r.Header.Get("X-Ghrouter-Session"))
+	s.telemetry.recordDecision(rid, ProfileRequest(&req))
 
 	provider, model := s.RouteOpenAIRequest(&req)
-	candidates := s.routeCandidates(req.Model, provider, model)
-	observability.Logger("routing").Info("request_routed", "request_id", requestID(r), "requested_model", req.Model, "provider", provider, "model", model, "candidates", len(candidates))
+	s.telemetry.recordSelection(rid, provider, model, req.SelectionStage, req.SelectionReason)
+	candidates := s.routeCandidates(req.Model, provider, model, &req)
+	if len(candidates) == 0 && isVirtualModelRequest(req.Model) {
+		if s.verifyVirtualRouteOnDemand(r.Context(), req.Model, &req) {
+			provider, model = s.RouteOpenAIRequest(&req)
+			s.telemetry.recordSelection(rid, provider, model, req.SelectionStage, req.SelectionReason)
+			candidates = s.routeCandidates(req.Model, provider, model, &req)
+		}
+	}
 	if len(candidates) == 0 {
 		status := http.StatusNotFound
 		code := "model_not_found"
@@ -1215,14 +1931,24 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(req.Model)), "ghrouter/") {
 			status = http.StatusServiceUnavailable
 			code = "model_unavailable"
-			message = fmt.Sprintf("no verified provider is available for model %q; run ghrouter verify-models", req.Model)
+			message = fmt.Sprintf("no verified provider is available for model %q; on-demand verification found no eligible provider", req.Model)
 		}
 		writeError(w, status, code, message)
 		end("error", false, "", req.Model, "/v1/chat/completions", time.Since(start))
 		return
 	}
+	if provider == "" || model == "" {
+		provider, model = candidates[0].provider, candidates[0].model
+		s.telemetry.recordSelection(rid, provider, model, req.SelectionStage, req.SelectionReason)
+	}
+	setRoutingHeaders(w, rid, req.Model, provider, model, req.SelectionStage, len(candidates), req.SelectionReason)
+	observability.Logger("routing").Info("request_routed", "request_id", requestID(r), "requested_model", req.Model, "provider", provider, "model", model, "candidates", len(candidates))
 	if fusion := s.fusionRoute(req.Model); fusion != nil {
 		s.handleFusionChat(r.Context(), w, &req, rid, end, start, candidates, fusion)
+		return
+	}
+	if graph := s.graphRoute(req.Model); graph != nil {
+		s.handleGraphChat(r.Context(), w, &req, rid, end, start, candidates, graph)
 		return
 	}
 
@@ -1237,6 +1963,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		candidateRequest := req
 		candidateRequest.Model = candidate.model
+		setRoutingHeaders(w, rid, req.Model, candidate.provider, candidate.model, req.SelectionStage, len(candidates), req.SelectionReason)
 		attemptStarted := time.Now()
 		started, streamErr := s.streamChat(r.Context(), w, runner, &candidateRequest, candidate.model)
 		attemptStatus := "ok"
@@ -1249,14 +1976,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		} else if !started {
 			s.recordModelFailure(candidate.provider, candidate.model, streamErr)
 		}
-		if streamErr != nil && !started && len(candidates) > 1 {
-			for i, next := range candidates[1:] {
+		if streamErr != nil && !started {
+			candidates = s.extendVirtualCandidatesAfterFailure(r.Context(), req.Model, &req, candidates)
+			for i := 1; i < len(candidates); i++ {
+				next := candidates[i]
 				nextRunner := s.getProvider(next.provider)
 				if nextRunner == nil {
 					continue
 				}
 				nextRequest := req
 				nextRequest.Model = next.model
+				setRoutingHeaders(w, rid, req.Model, next.provider, next.model, req.SelectionStage, len(candidates), req.SelectionReason)
 				attemptStarted = time.Now()
 				started, streamErr = s.streamChat(r.Context(), w, nextRunner, &nextRequest, next.model)
 				attemptStatus = "ok"
@@ -1269,7 +1999,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				} else if !started {
 					s.recordModelFailure(next.provider, next.model, streamErr)
 				}
-				if streamErr == nil || started || i == len(candidates[1:])-1 {
+				if streamErr == nil || started {
 					candidate = next
 					break
 				}
@@ -1285,13 +2015,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	for i, candidate := range candidates {
+	for i := 0; i < len(candidates); i++ {
+		candidate := candidates[i]
 		runner := s.getProvider(candidate.provider)
 		if runner == nil {
 			continue
 		}
 		candidateRequest := req
 		candidateRequest.Model = candidate.model
+		setRoutingHeaders(w, rid, req.Model, candidate.provider, candidate.model, req.SelectionStage, len(candidates), req.SelectionReason)
 		attemptStarted := time.Now()
 		promptTokens, completionTokens, err := s.nonStreamChat(r.Context(), w, runner, &candidateRequest, candidate.model)
 		attemptStatus := "ok"
@@ -1307,6 +2039,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		} else {
 			s.recordModelFailure(candidate.provider, candidate.model, err)
 			if i == len(candidates)-1 {
+				candidates = s.extendVirtualCandidatesAfterFailure(r.Context(), req.Model, &req, candidates)
+				if i < len(candidates)-1 {
+					continue
+				}
 				end("error", i > 0, candidate.provider, candidate.model, "/v1/chat/completions", time.Since(start))
 				writeError(w, 502, "provider_error", publicProviderError(err))
 				return
@@ -1320,16 +2056,29 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 type routeCandidate struct {
 	provider  string
 	model     string
+	resource  string
+	reason    string
 	tokenCost int
 }
 
-func (s *Server) routeCandidates(requested, selectedProvider, selectedModel string) []routeCandidate {
+func (s *Server) routeCandidates(requested, selectedProvider, selectedModel string, requests ...*types.OpenAIRequest) []routeCandidate {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.routeCandidatesLocked(requested, selectedProvider, selectedModel, requests...)
+}
+
+func (s *Server) routeCandidatesLocked(requested, selectedProvider, selectedModel string, requests ...*types.OpenAIRequest) []routeCandidate {
+	var req *types.OpenAIRequest
+	if len(requests) > 0 {
+		req = requests[0]
+	}
 	out := make([]routeCandidate, 0, len(s.cfg.Providers))
+	normalizedRequested := s.normalizeVirtualModelAlias(requested)
 	appendCandidate := func(provider, model string) {
 		if provider == "" || model == "" || !s.providerIsActive(provider) || !s.providerHealthy(provider) {
 			return
 		}
-		if s.configPath != "" && !s.modelRoutable(provider, model) {
+		if s.configPath != "" && !s.modelRoutable(provider, model) && !(provider == selectedProvider && model == selectedModel && s.modelExplicitlyRoutable(provider, model)) {
 			return
 		}
 		if s.catalog != nil && s.catalog.IsInCooldown(canonicalModelID(provider, model)) {
@@ -1340,52 +2089,62 @@ func (s *Server) routeCandidates(requested, selectedProvider, selectedModel stri
 				return
 			}
 		}
-		candidate := routeCandidate{provider: provider, model: model}
-		if entry := s.catalog.GetModel(canonicalModelID(provider, model)); entry != nil {
-			candidate.tokenCost = entry.TokenCost
+		candidate := s.resolveStableResource(provider, model)
+		if candidate.provider == "" || candidate.model == "" {
+			return
+		}
+		if req != nil && strings.HasPrefix(strings.ToLower(normalizedRequested), "ghrouter/") {
+			entry := s.catalog.GetModel(canonicalModelID(candidate.provider, candidate.model))
+			if entry == nil || !requestModelEligible(entry, ProfileRequest(req)) {
+				return
+			}
 		}
 		out = append(out, candidate)
 	}
 	appendCandidate(selectedProvider, selectedModel)
 	for _, list := range s.cfg.ModelLists {
-		if !strings.EqualFold(list.Name, requested) {
+		if !strings.EqualFold(list.Name, requested) && !strings.EqualFold(list.Name, normalizedRequested) {
 			continue
 		}
 		for _, reference := range list.Models {
-			provider, model := s.resolveModelReference(reference)
-			if provider == "" {
-				for _, candidateProvider := range s.cfg.Providers {
-					if candidateProvider == nil || !candidateProvider.Enabled {
-						continue
-					}
-					if resolved := s.resolveModel(candidateProvider, reference); resolved != "" {
-						provider, model = candidateProvider.Name, resolved
-						break
+			for _, leaf := range s.expandModelReferences(reference, make(map[string]bool)) {
+				provider, model := s.resolveModelReference(leaf)
+				if provider == "" {
+					for _, candidateProvider := range s.cfg.Providers {
+						if candidateProvider == nil || !candidateProvider.Enabled {
+							continue
+						}
+						if resolved := s.resolveModel(candidateProvider, leaf); resolved != "" {
+							provider, model = candidateProvider.Name, resolved
+							break
+						}
 					}
 				}
+				appendCandidate(provider, model)
 			}
-			appendCandidate(provider, model)
 		}
 		break
 	}
 	for _, list := range s.controlPlaneLists() {
-		if !strings.EqualFold(list.Name, requested) {
+		if !strings.EqualFold(list.Name, requested) && !strings.EqualFold(list.Name, normalizedRequested) {
 			continue
 		}
 		for _, reference := range list.Models {
-			provider, model := s.resolveModelReference(reference)
-			if provider == "" {
-				for _, candidateProvider := range s.cfg.Providers {
-					if candidateProvider == nil || !candidateProvider.Enabled {
-						continue
-					}
-					if resolved := s.resolveModel(candidateProvider, reference); resolved != "" {
-						provider, model = candidateProvider.Name, resolved
-						break
+			for _, leaf := range s.expandModelReferences(reference, make(map[string]bool)) {
+				provider, model := s.resolveModelReference(leaf)
+				if provider == "" {
+					for _, candidateProvider := range s.cfg.Providers {
+						if candidateProvider == nil || !candidateProvider.Enabled {
+							continue
+						}
+						if resolved := s.resolveModel(candidateProvider, leaf); resolved != "" {
+							provider, model = candidateProvider.Name, resolved
+							break
+						}
 					}
 				}
+				appendCandidate(provider, model)
 			}
-			appendCandidate(provider, model)
 		}
 		break
 	}
@@ -1402,7 +2161,81 @@ func (s *Server) routeCandidates(requested, selectedProvider, selectedModel stri
 		}
 		break
 	}
+	ranked := s.rankRouteCandidates(out, req)
+	if selectedProvider == "" || selectedModel == "" {
+		return ranked
+	}
+	for index, candidate := range ranked {
+		if candidate.provider != selectedProvider || candidate.model != selectedModel || index == 0 {
+			continue
+		}
+		selected := candidate
+		ranked = append([]routeCandidate{selected}, append(ranked[:index], ranked[index+1:]...)...)
+		break
+	}
+	return ranked
+}
+
+func (s *Server) rankRouteCandidates(candidates []routeCandidate, req *types.OpenAIRequest) []routeCandidate {
+	if len(candidates) < 2 || req == nil || !strings.HasPrefix(strings.ToLower(s.normalizeVirtualModelAlias(req.Model)), "ghrouter/") {
+		return candidates
+	}
+	preferred := make(map[string]bool, len(candidates))
+	entries := make([]*catalog.ModelEntry, 0, len(candidates))
+	for _, candidate := range candidates {
+		if entry := s.catalog.GetModel(canonicalModelID(candidate.provider, candidate.model)); entry != nil {
+			entries = append(entries, entry)
+		}
+	}
+	prioritized := prioritizeModelCandidates(entries, ProfileRequest(req), slotForRequest(req))
+	for _, entry := range prioritized {
+		if entry != nil {
+			preferred[canonicalModelID(entry.Provider, entry.Model)] = true
+		}
+	}
+	type ranked struct {
+		candidate routeCandidate
+		index     int
+		score     float64
+		preferred bool
+	}
+	rankedCandidates := make([]ranked, 0, len(candidates))
+	for index, candidate := range candidates {
+		rankedCandidates = append(rankedCandidates, ranked{
+			candidate: candidate,
+			index:     index,
+			score:     s.requestModelScore(candidate.provider, candidate.model, req),
+			preferred: preferred[canonicalModelID(candidate.provider, candidate.model)],
+		})
+	}
+	sort.SliceStable(rankedCandidates, func(i, j int) bool {
+		if rankedCandidates[i].preferred != rankedCandidates[j].preferred {
+			return rankedCandidates[i].preferred
+		}
+		return rankedCandidates[i].score > rankedCandidates[j].score
+	})
+	out := make([]routeCandidate, 0, len(rankedCandidates))
+	for _, item := range rankedCandidates {
+		out = append(out, item.candidate)
+	}
 	return out
+}
+
+func (s *Server) resolveStableResource(provider, model string) routeCandidate {
+	candidate := routeCandidate{provider: provider, model: model, resource: canonicalModelID(provider, model)}
+	if candidate.provider == "" || candidate.model == "" {
+		return routeCandidate{}
+	}
+	candidate.reason = "configured"
+	if s.catalog != nil {
+		if entry := s.catalog.GetModel(candidate.resource); entry != nil {
+			candidate.tokenCost = entry.TokenCost
+			if entry.HealthStatus == health.HealthHealthy {
+				candidate.reason = "catalog_healthy"
+			}
+		}
+	}
+	return candidate
 }
 
 func (s *Server) resolveModelReference(reference string) (string, string) {
@@ -1442,7 +2275,7 @@ func (s *Server) resolveModelReference(reference string) (string, string) {
 
 // route maps a requested model (or empty) to provider + concrete model
 func (s *Server) RouteModel(requested string) (provider string, model string) {
-	provider, model = s.routeByModelName(requested, "")
+	provider, model = s.routeByModelName(requested, "", nil)
 	if provider == "" || model == "" {
 		return provider, model
 	}
@@ -1455,13 +2288,49 @@ func (s *Server) RouteModel(requested string) (provider string, model string) {
 }
 
 func (s *Server) TestModel(ctx context.Context, requested string) ModelTestResult {
-	result := ModelTestResult{Requested: requested, Status: "unrouted"}
-	provider, model := s.resolveProbeTarget(requested)
-	result.Provider, result.Model = provider, model
-	if provider == "" || model == "" {
-		result.Error = "no functional provider/model is available"
-		return result
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	provider, model := s.resolveProbeTarget(requested)
+	if provider == "" || model == "" {
+		return ModelTestResult{Requested: requested, Status: "unrouted", Error: "no functional provider/model is available"}
+	}
+	key := canonicalModelID(provider, model)
+	s.probeMu.Lock()
+	if s.probeFlights == nil {
+		s.probeFlights = make(map[string]*modelProbeFlight)
+	}
+	if flight := s.probeFlights[key]; flight != nil {
+		done := flight.done
+		s.probeMu.Unlock()
+		select {
+		case <-done:
+			s.probeMu.Lock()
+			result := flight.result
+			s.probeMu.Unlock()
+			result.Requested = requested
+			return result
+		case <-ctx.Done():
+			return ModelTestResult{Requested: requested, Provider: provider, Model: model, Status: "cooldown", Error: "model verification already in progress; probe deferred"}
+		}
+	}
+	flight := &modelProbeFlight{done: make(chan struct{})}
+	s.probeFlights[key] = flight
+	s.probeMu.Unlock()
+
+	probeCtx, cancel := context.WithTimeout(ctx, modelProbeTimeout)
+	result := s.testModelResolved(probeCtx, requested, provider, model)
+	cancel()
+	s.probeMu.Lock()
+	flight.result = result
+	close(flight.done)
+	delete(s.probeFlights, key)
+	s.probeMu.Unlock()
+	return result
+}
+
+func (s *Server) testModelResolved(ctx context.Context, requested, provider, model string) ModelTestResult {
+	result := ModelTestResult{Requested: requested, Provider: provider, Model: model, Status: "unrouted"}
 	if entry := s.catalog.GetModel(canonicalModelID(provider, model)); entry != nil && s.catalog.IsInCooldown(canonicalModelID(provider, model)) {
 		result.Status = "cooldown"
 		result.Error = "model is in cooldown; verification is deferred until the reset window"
@@ -1476,9 +2345,12 @@ func (s *Server) TestModel(ctx context.Context, requested string) ModelTestResul
 	}
 	started := time.Now()
 	var output strings.Builder
+	maxTokens := 8
 	events, errorsCh := runner.Invoke(ctx, &types.OpenAIRequest{
-		Model:    model,
-		Messages: []types.OpenAIMessage{{Role: "user", Content: "say hello"}},
+		Model:              model,
+		MaxTokens:          &maxTokens,
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
+		Messages:           []types.OpenAIMessage{{Role: "user", Content: "Reply exactly OK."}},
 	})
 	var invokeErr error
 	for events != nil || errorsCh != nil {
@@ -1505,10 +2377,12 @@ func (s *Server) TestModel(ctx context.Context, requested string) ModelTestResul
 		}
 	}
 	probeOutput := strings.ToLower(strings.TrimSpace(output.String()))
-	if invokeErr == nil && probeOutput != "ghrouter_model_probe_ok" && !strings.Contains(probeOutput, "ghrouter_model_probe_ok") && !strings.Contains(probeOutput, "hello") {
+	observability.Logger("probe").Debug("model_probe_completed", "provider", provider, "model", model, "output_bytes", len(probeOutput), "invoke_error_type", observability.ErrorType(invokeErr))
+	if invokeErr == nil && !validModelProbeOutput(probeOutput) {
 		invokeErr = fmt.Errorf("provider returned an invalid model probe response")
 	}
-	result.LatencyMS = time.Since(started).Milliseconds()
+	latency := time.Since(started)
+	result.LatencyMS = latency.Milliseconds()
 	if invokeErr != nil {
 		result.Status = "failed"
 		result.Error = publicProviderError(invokeErr)
@@ -1520,8 +2394,25 @@ func (s *Server) TestModel(ctx context.Context, requested string) ModelTestResul
 	}
 	result.OK = true
 	result.Status = "healthy"
+	s.catalog.RecordLatency(canonicalModelID(provider, model), latency)
 	s.catalog.RecordSuccess(provider+"/"+model, time.Now())
 	return result
+}
+
+func validModelProbeOutput(output string) bool {
+	output = strings.TrimSpace(strings.ToLower(output))
+	if output == "" || len(output) > 4096 {
+		return false
+	}
+	if strings.Contains(output, modelProbeMarker) {
+		return true
+	}
+	for _, marker := range []string{"provider error", "provider failed", "request failed", "timed out", "timeout", "unavailable", "rate limit", "quota exceeded"} {
+		if strings.Contains(output, marker) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Server) resolveProbeTarget(requested string) (provider, model string) {
@@ -1532,6 +2423,11 @@ func (s *Server) resolveProbeTarget(requested string) (provider, model string) {
 	for _, p := range s.cfg.Providers {
 		if p == nil || !p.Enabled {
 			continue
+		}
+		for _, configured := range p.Models {
+			if strings.EqualFold(strings.TrimSpace(configured), requested) {
+				return p.Name, configured
+			}
 		}
 		if strings.HasPrefix(requested, p.Name+"/") {
 			if resolved := s.resolveModel(p, strings.TrimPrefix(requested, p.Name+"/")); resolved != "" {
@@ -1560,6 +2456,10 @@ func (s *Server) recordModelFailure(provider, model string, err error) {
 	}
 	now := time.Now()
 	var restoreAt time.Time
+	var capacityErr *providers.CapacityError
+	if errors.As(err, &capacityErr) && capacityErr.RetryAfter > 0 {
+		restoreAt = now.Add(capacityErr.RetryAfter)
+	}
 	for _, configured := range s.cfg.Providers {
 		if configured != nil && configured.Name == provider {
 			status := account.Load(configured)
@@ -1577,7 +2477,7 @@ func isQuotaError(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	for _, marker := range []string{"quota", "rate limit", "rate_limit", "too many requests", "insufficient credits", "usage limit", "credits exhausted", "monthly limit"} {
+	for _, marker := range []string{"quota", "rate limit", "rate_limit", "too many requests", "insufficient credits", "usage limit", "weekly limit", "monthly limit", "credits exhausted", "upgrade your plan", "extra usage", "third-party apps", "seven_day"} {
 		if strings.Contains(message, marker) {
 			return true
 		}
@@ -1585,8 +2485,8 @@ func isQuotaError(err error) bool {
 	return false
 }
 
-func (s *Server) routeByModelName(requested, sessionID string) (provider string, model string) {
-	if provider, model = s.resolveModelList(requested); provider != "" {
+func (s *Server) routeByModelName(requested, sessionID string, req *types.OpenAIRequest) (provider string, model string) {
+	if provider, model = s.resolveModelList(s.normalizeVirtualModelAlias(requested), req); provider != "" {
 		return provider, model
 	}
 
@@ -1595,18 +2495,55 @@ func (s *Server) routeByModelName(requested, sessionID string) (provider string,
 		if !p.Enabled {
 			continue
 		}
+		if strings.HasPrefix(requested, p.Name+"/") {
+			rest := strings.TrimPrefix(requested, p.Name+"/")
+			if model = s.resolveModel(p, rest); model != "" {
+				if !s.modelExplicitlyRoutable(p.Name, model) {
+					if !s.providerHealthy(p.Name) || !s.modelPolicyAllows(p.Name, model) || (p.Name == "local-brain" && !s.brainReadyForSelection()) || (s.catalog != nil && s.catalog.IsInCooldown(canonicalModelID(p.Name, model))) {
+						return "", ""
+					}
+					return p.Name, model
+				}
+				if !s.modelPolicyAllows(p.Name, model) {
+					return "", ""
+				}
+				return p.Name, model
+			}
+			if p.Name == "local-brain" && !s.brainReadyForSelection() {
+				return "", ""
+			}
+			return p.Name, rest
+		}
 		pref := prefixFor(p.Type)
 		if pref != "" && strings.HasPrefix(requested, pref) {
 			rest := strings.TrimPrefix(requested, pref)
-			if model = s.resolveModel(p, rest); model != "" && s.modelRoutable(p.Name, model) {
+			if model = s.resolveModel(p, rest); model != "" {
+				if !s.modelExplicitlyRoutable(p.Name, model) {
+					if !s.providerHealthy(p.Name) || !s.modelPolicyAllows(p.Name, model) || (p.Name == "local-brain" && !s.brainReadyForSelection()) || (s.catalog != nil && s.catalog.IsInCooldown(canonicalModelID(p.Name, model))) {
+						return "", ""
+					}
+					return p.Name, model
+				}
+				if !s.modelPolicyAllows(p.Name, model) {
+					return "", ""
+				}
 				return p.Name, model
 			}
+			if p.Name == "local-brain" && !s.brainReadyForSelection() {
+				return "", ""
+			}
+			// An explicit provider prefix must not silently fall through to
+			// another provider when the requested model is unknown.
+			return p.Name, rest
 		}
 	}
 
 	// empty model -> first healthy provider
 	if requested == "" {
 		if model := s.catalog.GetModelBySlot(catalog.SlotAuto); model != nil {
+			if model.Provider == "local-brain" && !s.brainReadyForSelection() {
+				return "", ""
+			}
 			return model.Provider, model.Model
 		}
 		return "", ""
@@ -1617,12 +2554,12 @@ func (s *Server) routeByModelName(requested, sessionID string) (provider string,
 		if !p.Enabled {
 			continue
 		}
-		if model = s.resolveModel(p, requested); model != "" && s.modelRoutable(p.Name, model) {
+		if model = s.resolveModel(p, requested); model != "" && s.modelExplicitlyRoutable(p.Name, model) {
 			return p.Name, model
 		}
 	}
 
-	if model := s.catalog.GetModel(requested); model != nil && s.modelRoutable(model.Provider, model.Model) {
+	if model := s.catalog.GetModel(requested); model != nil && s.modelExplicitlyRoutable(model.Provider, model.Model) {
 		return model.Provider, model.Model
 	}
 
@@ -1640,7 +2577,30 @@ func (s *Server) routeByModelName(requested, sessionID string) (provider string,
 	return "", ""
 }
 
-func (s *Server) resolveModelList(requested string) (string, string) {
+func (s *Server) normalizeVirtualModelAlias(requested string) string {
+	name := strings.TrimSpace(requested)
+	if name == "" || strings.Contains(name, "/") {
+		return name
+	}
+	alias := "ghrouter/" + strings.ToLower(name)
+	for _, list := range s.cfg.ModelLists {
+		if strings.EqualFold(list.Name, alias) {
+			return alias
+		}
+	}
+	for _, list := range s.controlPlaneLists() {
+		if strings.EqualFold(list.Name, alias) {
+			return alias
+		}
+	}
+	return name
+}
+
+func (s *Server) resolveModelList(requested string, requests ...*types.OpenAIRequest) (string, string) {
+	var req *types.OpenAIRequest
+	if len(requests) > 0 {
+		req = requests[0]
+	}
 	var selected *types.ModelList
 	for i := range s.cfg.ModelLists {
 		if strings.EqualFold(s.cfg.ModelLists[i].Name, requested) {
@@ -1683,18 +2643,66 @@ func (s *Server) resolveModelList(requested string) (string, string) {
 			if provider == "" || model == "" || !s.providerHealthy(provider) || !s.modelRoutable(provider, model) {
 				continue
 			}
-			score := 1.0
+			score := s.requestModelScore(provider, model, req)
+			if score <= -100000 {
+				continue
+			}
 			if entry := s.catalog.GetModel(canonicalModelID(provider, model)); entry != nil {
 				score += float64(entry.ProviderWeight)
-				if entry.LatencyP50 > 0 {
-					score -= entry.LatencyP50.Seconds()
-				}
 			}
 			candidates = append(candidates, candidate{provider: provider, model: model, score: score})
 		}
 	}
+	if strings.EqualFold(selected.Kind, "automatic") && req != nil {
+		for _, providerConfig := range s.cfg.Providers {
+			if providerConfig == nil || providerConfig.Type != types.ProviderLocal || !providerConfig.Enabled {
+				continue
+			}
+			for _, model := range providerConfig.Models {
+				if model == "" || !s.providerHealthy(providerConfig.Name) || !s.modelRoutable(providerConfig.Name, model) {
+					continue
+				}
+				duplicate := false
+				for _, item := range candidates {
+					if item.provider == providerConfig.Name && item.model == model {
+						duplicate = true
+						break
+					}
+				}
+				if duplicate {
+					continue
+				}
+				score := s.requestModelScore(providerConfig.Name, model, req)
+				if score > -100000 {
+					candidates = append(candidates, candidate{provider: providerConfig.Name, model: model, score: score})
+				}
+			}
+		}
+	}
 	if len(candidates) == 0 {
 		return "", ""
+	}
+	if strings.EqualFold(selected.Kind, "automatic") && req != nil {
+		entries := make([]*catalog.ModelEntry, 0, len(candidates))
+		for _, item := range candidates {
+			if entry := s.catalog.GetModel(canonicalModelID(item.provider, item.model)); entry != nil {
+				entries = append(entries, entry)
+			}
+		}
+		entries = prioritizeModelCandidates(entries, ProfileRequest(req), slotForRequest(req))
+		if brainSelected := s.selectWithLocalBrain(req, entries); brainSelected != nil {
+			req.SelectionStage = "local_brain"
+			return brainSelected.Provider, brainSelected.Model
+		}
+		req.SelectionStage = "fast_backup"
+		req.SelectionReason = "fast healthy backup after automatic candidate ranking"
+		if selectedCandidate := bestScoredCandidate(s, entries, req); selectedCandidate != nil {
+			if selectedCandidate.Provider == "local-brain" {
+				req.SelectionStage = "local_brain"
+				req.SelectionReason = "local brain deterministic fallback"
+			}
+			return selectedCandidate.Provider, selectedCandidate.Model
+		}
 	}
 	if strings.EqualFold(selected.Strategy, "round-robin") {
 		s.routeMu.Lock()
@@ -1710,6 +2718,182 @@ func (s *Server) resolveModelList(requested string) (string, string) {
 		}
 	}
 	return best.provider, best.model
+}
+
+func (s *Server) requestModelScore(provider, model string, req *types.OpenAIRequest) float64 {
+	score := 1.0
+	score += s.modelPolicyScore(provider, model)
+	if req == nil || s.catalog == nil {
+		return score
+	}
+	entry := s.catalog.GetModel(canonicalModelID(provider, model))
+	if entry == nil {
+		return score
+	}
+	profile := ProfileRequest(req)
+	if !requestModelEligible(entry, profile) {
+		return -100000
+	}
+	score += quotaScore(account.Load(s.providerConfig(provider)))
+	if profile.CostClass == CostClassEconomy {
+		switch entry.CostTier {
+		case catalog.CostFree:
+			score += 80
+		case catalog.CostCheap:
+			score += 40
+		case catalog.CostPremium:
+			score -= 80
+		}
+	}
+	if profile.NeedsVision && entry.Vision {
+		score += 80
+	}
+	if profile.NeedsTools && entry.ToolUse {
+		score += 80
+	}
+	if profile.NeedsLongContext && entry.ContextWindow >= profile.EstimatedTokens {
+		score += 80
+	}
+	score += contextCapacityScore(profile, entry.ContextWindow)
+	for _, candidateSlot := range entry.VirtualSlots {
+		if candidateSlot == slotForRequest(req) {
+			score += 100
+			break
+		}
+	}
+	if wanted := strings.ToLower(strings.TrimSpace(req.ReasoningEffort)); wanted != "" {
+		for _, effort := range entry.Effort {
+			if strings.EqualFold(effort, wanted) {
+				score += 40
+				break
+			}
+		}
+	}
+	if entry.LatencyP50 > 0 {
+		score -= entry.LatencyP50.Seconds()
+	}
+	score -= entry.ErrorRate * 100
+	return score
+}
+
+func contextCapacityScore(profile RequestProfile, contextWindow int) float64 {
+	if !profile.NeedsLongContext && profile.Complexity != ComplexityHigh && profile.Complexity != ComplexityCritical {
+		return 0
+	}
+	switch {
+	case contextWindow >= 1_000_000:
+		return 60
+	case contextWindow >= 128_000:
+		return 40
+	case contextWindow >= 32_000:
+		return 20
+	default:
+		return 0
+	}
+}
+
+func requestModelEligible(entry *catalog.ModelEntry, profile RequestProfile) bool {
+	if entry == nil {
+		return false
+	}
+	if profile.NeedsTools && !entry.ToolUse {
+		return false
+	}
+	if profile.NeedsVision && !entry.Vision {
+		return false
+	}
+	if profile.NeedsLongContext && (entry.ContextWindow <= 0 || entry.ContextWindow < profile.EstimatedTokens) {
+		return false
+	}
+	if profile.RequestedOutput > 0 {
+		if entry.MaxOutput > 0 && profile.RequestedOutput > entry.MaxOutput {
+			return false
+		}
+		if entry.ContextWindow > 0 && profile.EstimatedTokens+profile.RequestedOutput > entry.ContextWindow {
+			return false
+		}
+	}
+	if effort := strings.ToLower(strings.TrimSpace(profile.ReasoningEffort)); effort != "" && effort != "none" && len(entry.Effort) > 0 {
+		for _, supported := range entry.Effort {
+			if strings.EqualFold(strings.TrimSpace(supported), effort) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+func (s *Server) providerConfig(name string) *types.Provider {
+	if s == nil || s.cfg == nil {
+		return nil
+	}
+	for _, provider := range s.cfg.Providers {
+		if provider != nil && provider.Name == name {
+			return provider
+		}
+	}
+	return nil
+}
+
+func (s *Server) modelPolicyAllows(provider, model string) bool {
+	if s == nil || s.cfg == nil {
+		return true
+	}
+	policy := s.cfg.ModelPolicy
+	reference := strings.ToLower(strings.TrimSpace(canonicalModelID(provider, model)))
+	if reference == "/" {
+		return false
+	}
+	if len(policy.Excluded) > 0 && matchesModelPolicy(reference, policy.Excluded) {
+		return false
+	}
+	if len(policy.Allowed) > 0 && !matchesModelPolicy(reference, policy.Allowed) {
+		if provider != "local-brain" {
+			return false
+		}
+	}
+	if s.catalog != nil && (policy.MaxCostMicros > 0 || policy.MaxDiscoveryAge > 0) {
+		entry := s.catalog.GetModel(canonicalModelID(provider, model))
+		if entry != nil {
+			if policy.MaxCostMicros > 0 && entry.TokenCost > policy.MaxCostMicros {
+				return false
+			}
+			if policy.MaxDiscoveryAge > 0 && !entry.Info.DiscoveredAt.IsZero() && time.Since(entry.Info.DiscoveredAt) > policy.MaxDiscoveryAge {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (s *Server) modelPolicyScore(provider, model string) float64 {
+	if s == nil || s.cfg == nil {
+		return 0
+	}
+	if !s.modelPolicyAllows(provider, model) {
+		return -100000
+	}
+	if matchesModelPolicy(strings.ToLower(canonicalModelID(provider, model)), s.cfg.ModelPolicy.Preferred) {
+		return 1000
+	}
+	return 0
+}
+
+func matchesModelPolicy(reference string, patterns []string) bool {
+	for _, raw := range patterns {
+		pattern := strings.ToLower(strings.TrimSpace(raw))
+		if pattern == "" {
+			continue
+		}
+		if strings.HasSuffix(pattern, "/*") && strings.HasPrefix(reference, strings.TrimSuffix(pattern, "*")) {
+			return true
+		}
+		if ok, _ := path.Match(pattern, reference); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) expandModelReferences(reference string, visiting map[string]bool) []string {
@@ -1741,17 +2925,17 @@ func slotForRequest(req *types.OpenAIRequest) catalog.VirtualSlot {
 	}
 	text := requestText(req)
 	switch {
-	case containsAny(text, "vision", "image", "screenshot", "photo"):
+	case containsAny(text, "vision", "image", "screenshot", "photo", "imagem", "foto", "captura", "diagrama"):
 		return catalog.SlotVision
-	case containsAny(text, "cheap", "cheapest", "free", "budget", "low cost"):
+	case containsAny(text, "cheap", "cheapest", "free", "budget", "low cost", "barato", "gratis", "gratuito", "gratuita", "custo", "orcamento"):
 		return catalog.SlotCheapChat
 	case len(text) > 6000 || (req.MaxTokens != nil && *req.MaxTokens >= 100000):
 		return catalog.SlotLongContext
-	case containsAny(text, "fast", "quick", "low latency", "instant"):
+	case containsAny(text, "fast", "quick", "low latency", "instant", "rapido", "latencia"):
 		return catalog.SlotFastCode
-	case containsAny(text, "code", "bug", "compile", "test", "refactor", "golang", "go "):
+	case containsAny(text, "code", "bug", "compile", "test", "refactor", "golang", "go ", "codigo", "depurar", "compilar", "implementar", "refatorar", "teste"):
 		return catalog.SlotFastCode
-	case containsAny(text, "reason", "plan", "analyze", "design", "architecture"):
+	case containsAny(text, "reason", "plan", "analyze", "design", "architecture", "raciocinio", "planejar", "planejamento", "analisar", "arquitetura", "decisao"):
 		return catalog.SlotStrongReason
 	default:
 		return catalog.SlotAuto
@@ -1805,7 +2989,7 @@ func (s *Server) resolveConfiguredRoute(route *types.Route, requested, sessionID
 
 	switch routeStrategy(route) {
 	case "auto":
-		if model := s.catalog.BestHealthyModel(); model != nil {
+		if model := s.bestPolicyModelForRequest(nil); model != nil {
 			return model.Provider, model.Model
 		}
 		return "", ""
@@ -1813,6 +2997,8 @@ func (s *Server) resolveConfiguredRoute(route *types.Route, requested, sessionID
 		return s.resolveRoundRobinRoute(route, requested)
 	case "fusion":
 		return s.resolveFusionRoute(route, requested)
+	case "graph":
+		return s.resolveGraphRoute(route, requested)
 	case "sticky":
 		return s.resolveStickyRoute(route, requested, sessionID)
 	}
@@ -1827,11 +3013,19 @@ func (s *Server) resolveConfiguredRoute(route *types.Route, requested, sessionID
 		}
 	}
 
-	if model := s.catalog.BestHealthyModel(); model != nil {
+	if model := s.bestPolicyModelForRequest(nil); model != nil {
 		return model.Provider, model.Model
 	}
 
 	return "", ""
+}
+
+func (s *Server) resolveGraphRoute(route *types.Route, requested string) (provider string, model string) {
+	candidates := s.healthyFallbacks(route)
+	if len(candidates) == 0 {
+		return "", ""
+	}
+	return s.resolveProviderChoice(candidates[0], requested)
 }
 
 func (s *Server) resolveRoundRobinRoute(route *types.Route, requested string) (provider string, model string) {
@@ -1928,7 +3122,7 @@ func (s *Server) resolveStickyRoute(route *types.Route, requested, sessionID str
 
 func (s *Server) healthyFallbacks(route *types.Route) []string {
 	out := make([]string, 0, len(route.Fallback)+1)
-	if route.Provider != "" && route.Provider != "round-robin" && route.Provider != "fusion" && route.Provider != "sticky" && route.Provider != "auto" {
+	if route.Provider != "" && route.Provider != "round-robin" && route.Provider != "fusion" && route.Provider != "graph" && route.Provider != "sticky" && route.Provider != "auto" {
 		out = append(out, route.Provider)
 	}
 	out = append(out, route.Fallback...)
@@ -2003,17 +3197,12 @@ func (s *Server) providerHealthy(name string) bool {
 		return false
 	}
 	for _, provider := range s.cfg.Providers {
-		if provider != nil && provider.Name == name && !s.providerAuthReady(provider) {
-			if provider.Type == types.ProviderLocal {
-				return false
-			}
-		}
-		if provider != nil && provider.Name == name && provider.Type == types.ProviderLocal {
+		if provider != nil && provider.Name == name {
 			status := account.Load(provider)
-			if account.Blocked(status) {
+			if providerCapacityBlocked(provider, status) {
 				return false
 			}
-			if status.Balance != nil && *status.Balance <= 0 && !status.ResetAt.IsZero() && time.Now().Before(status.ResetAt) {
+			if provider.Type == types.ProviderLocal && !s.providerAuthReady(provider) {
 				return false
 			}
 		}
@@ -2030,11 +3219,70 @@ func (s *Server) providerHealthy(name string) bool {
 	return true
 }
 
+func providerCapacityBlocked(provider *types.Provider, status account.Status) bool {
+	if provider == nil {
+		return false
+	}
+	if status.Source == "auth" || status.Source == "unavailable" || status.Source == "missing-provider" || status.Source == "unsupported" || status.Source == "unknown" {
+		return false
+	}
+	if account.Blocked(status) {
+		return true
+	}
+	return status.Balance != nil && *status.Balance <= 0 && !status.ResetAt.IsZero() && time.Now().Before(status.ResetAt)
+}
+
+func providerHasHealthyCatalogModel(entries []*catalog.ModelEntry) bool {
+	if len(entries) == 0 {
+		return true
+	}
+	now := time.Now()
+	hasFailureEvidence := false
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		if entry.HealthStatus == health.HealthHealthy {
+			if entry.CooldownUntil.IsZero() || !now.Before(entry.CooldownUntil) {
+				return true
+			}
+			continue
+		}
+		if entry.HealthStatus == health.HealthCooldown || entry.HealthStatus == health.HealthUnhealthy {
+			hasFailureEvidence = true
+		}
+		if !entry.CooldownUntil.IsZero() && now.Before(entry.CooldownUntil) {
+			hasFailureEvidence = true
+		}
+	}
+	return !hasFailureEvidence
+}
+
 func (s *Server) modelRoutable(provider, model string) bool {
 	if provider == "" || model == "" {
 		return false
 	}
 	if !s.modelVerified(provider, model) {
+		return false
+	}
+	if !s.modelExplicitlyRoutable(provider, model) {
+		return false
+	}
+	if s.catalog == nil {
+		return true
+	}
+	entry := s.catalog.GetModel(canonicalModelID(provider, model))
+	return entry == nil || entry.HealthStatus == health.HealthHealthy
+}
+
+func (s *Server) modelExplicitlyRoutable(provider, model string) bool {
+	if provider == "" || model == "" || !s.providerIsActive(provider) || !s.providerHealthy(provider) {
+		return false
+	}
+	if provider == "local-brain" && !s.brainReadyForSelection() {
+		return false
+	}
+	if !s.modelPolicyAllows(provider, model) {
 		return false
 	}
 	for _, configured := range s.cfg.Providers {
@@ -2049,24 +3297,99 @@ func (s *Server) modelRoutable(provider, model string) bool {
 	if entry == nil {
 		return true
 	}
-	return entry.HealthStatus == health.HealthHealthy && !s.catalog.IsInCooldown(canonicalModelID(provider, model))
+	return entry.HealthStatus != health.HealthUnhealthy && entry.HealthStatus != health.HealthCooldown && !s.catalog.IsInCooldown(canonicalModelID(provider, model))
+}
+
+func (s *Server) modelAdvertised(provider, model string) bool {
+	if !s.modelExplicitlyRoutable(provider, model) {
+		return false
+	}
+	if s.catalog == nil {
+		return true
+	}
+	entry := s.catalog.GetModel(canonicalModelID(provider, model))
+	return entry == nil || (entry.HealthStatus != health.HealthUnhealthy && !s.catalog.IsInCooldown(canonicalModelID(provider, model)))
+}
+
+func (s *Server) reportedModelHealth(provider, model string, status health.HealthStatus) health.HealthStatus {
+	if status == health.HealthHealthy && s.configPath != "" && !s.modelVerified(provider, model) {
+		return health.HealthUnknown
+	}
+	return status
+}
+
+func (s *Server) modelVisible(provider, model string) bool {
+	if provider == "" || model == "" {
+		return false
+	}
+	if !s.modelPolicyAllows(provider, model) {
+		return false
+	}
+	if !s.modelVerified(provider, model) {
+		return false
+	}
+	if s.catalog == nil {
+		return true
+	}
+	entry := s.catalog.GetModel(canonicalModelID(provider, model))
+	if entry == nil {
+		return true
+	}
+	return entry.HealthStatus != health.HealthCooldown
 }
 
 func (s *Server) modelVerified(providerName, modelName string) bool {
 	if s == nil || s.configPath == "" {
 		return true
 	}
+	if s.catalog != nil {
+		if entry := s.catalog.GetModel(canonicalModelID(providerName, modelName)); entry != nil {
+			if !entry.Info.VerifiedAt.IsZero() {
+				return true
+			}
+			if strings.TrimSpace(entry.Info.VerificationError) != "" {
+				return false
+			}
+		}
+	}
 	for _, provider := range s.cfg.Providers {
 		if provider == nil || provider.Name != providerName {
 			continue
 		}
-		metadata, ok := provider.ModelInfo[modelName]
+		metadata, ok := modelInfoForProvider(provider, modelName)
 		if !ok {
 			return provider.Type == types.ProviderCustom || provider.Type == types.ProviderLocal
 		}
 		return !metadata.VerifiedAt.IsZero()
 	}
 	return false
+}
+
+func modelInfoForProvider(provider *types.Provider, model string) (types.ModelInfo, bool) {
+	key := modelInfoKeyForProvider(provider, model)
+	if key == "" {
+		return types.ModelInfo{}, false
+	}
+	return provider.ModelInfo[key], true
+}
+
+func modelInfoKeyForProvider(provider *types.Provider, model string) string {
+	if provider == nil || len(provider.ModelInfo) == 0 {
+		return ""
+	}
+	if _, ok := provider.ModelInfo[model]; ok {
+		return model
+	}
+	canonical := canonicalModelID(provider.Name, model)
+	if _, ok := provider.ModelInfo[canonical]; ok {
+		return canonical
+	}
+	for key := range provider.ModelInfo {
+		if canonicalModelID(provider.Name, key) == canonical {
+			return key
+		}
+	}
+	return ""
 }
 
 func (s *Server) visibleProviderModels(providerName string) []string {
@@ -2076,7 +3399,7 @@ func (s *Server) visibleProviderModels(providerName string) []string {
 		}
 		models := make([]string, 0, len(provider.Models))
 		for _, model := range provider.Models {
-			if s.modelRoutable(providerName, model) {
+			if s.modelVisible(providerName, model) {
 				models = append(models, canonicalModelID(providerName, model))
 			}
 		}
@@ -2085,9 +3408,29 @@ func (s *Server) visibleProviderModels(providerName string) []string {
 	return nil
 }
 
+func (s *Server) catalogProviderModels(providerName string) []string {
+	if s == nil || s.catalog == nil {
+		return nil
+	}
+	models := make([]string, 0)
+	for _, model := range s.catalog.GetAllModels() {
+		if model == nil || model.Provider != providerName {
+			continue
+		}
+		models = append(models, canonicalModelID(providerName, model.Model))
+	}
+	sort.Strings(models)
+	return models
+}
+
 func (s *Server) providerAuthReady(provider *types.Provider) bool {
+	ready, _ := s.providerAuthStatus(provider)
+	return ready
+}
+
+func (s *Server) providerAuthStatus(provider *types.Provider) (bool, string) {
 	if provider == nil {
-		return false
+		return false, "provider missing"
 	}
 	now := time.Now()
 	s.authMu.Lock()
@@ -2096,14 +3439,15 @@ func (s *Server) providerAuthReady(provider *types.Provider) bool {
 	}
 	if cached, ok := s.authCache[provider.Name]; ok && now.Sub(cached.checkedAt) < 15*time.Second {
 		s.authMu.Unlock()
-		return cached.ready
+		return cached.ready, cached.reason
 	}
 	s.authMu.Unlock()
-	ready := local_brain.AuthReason(provider) == ""
+	reason := local_brain.AuthReason(provider)
+	ready := reason == ""
 	s.authMu.Lock()
-	s.authCache[provider.Name] = authCacheEntry{checkedAt: now, ready: ready}
+	s.authCache[provider.Name] = authCacheEntry{checkedAt: now, ready: ready, reason: reason}
 	s.authMu.Unlock()
-	return ready
+	return ready, reason
 }
 
 func matchPattern(name, pattern string) bool {
@@ -2123,93 +3467,142 @@ func (s *Server) getProvider(name string) *providers.ProviderRunner {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
+	functionalOnly := false
+	if raw := strings.TrimSpace(r.URL.Query().Get("functional_only")); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_functional_only", "functional_only must be a boolean")
+			return
+		}
+		functionalOnly = parsed
+	}
 
 	type modelEntry struct {
-		ID            string    `json:"id"`
-		Object        string    `json:"object"`
-		Created       int64     `json:"created"`
-		OwnedBy       string    `json:"owned_by"`
-		Provenance    string    `json:"provenance,omitempty"`
-		Health        string    `json:"health"`
-		CooldownUntil time.Time `json:"cooldown_until,omitempty"`
-		ContextWindow int       `json:"context_window,omitempty"`
-		MaxOutput     int       `json:"max_output,omitempty"`
-		TokenCost     int       `json:"token_cost,omitempty"`
-		Thinking      bool      `json:"thinking,omitempty"`
-		Vision        bool      `json:"vision,omitempty"`
-		ToolUse       bool      `json:"tool_use,omitempty"`
-		Effort        []string  `json:"effort,omitempty"`
-		CatalogSource string    `json:"catalog_source,omitempty"`
-		List          bool      `json:"list,omitempty"`
-		Members       []string  `json:"members,omitempty"`
+		ID              string         `json:"id"`
+		Object          string         `json:"object"`
+		Created         int64          `json:"created"`
+		OwnedBy         string         `json:"owned_by"`
+		Provenance      string         `json:"provenance,omitempty"`
+		Health          string         `json:"health"`
+		Classifications []string       `json:"classifications,omitempty"`
+		CooldownUntil   *time.Time     `json:"cooldown_until,omitempty"`
+		ContextWindow   int            `json:"context_window,omitempty"`
+		MaxOutput       int            `json:"max_output,omitempty"`
+		TokenCost       int            `json:"token_cost,omitempty"`
+		Thinking        bool           `json:"thinking,omitempty"`
+		Vision          bool           `json:"vision,omitempty"`
+		ToolUse         bool           `json:"tool_use,omitempty"`
+		Capabilities    map[string]any `json:"capabilities,omitempty"`
+		Effort          []string       `json:"effort,omitempty"`
+		Kind            string         `json:"kind,omitempty"`
+		Modalities      []string       `json:"modalities,omitempty"`
+		CatalogSource   string         `json:"catalog_source,omitempty"`
+		List            bool           `json:"list,omitempty"`
+		Members         []string       `json:"members,omitempty"`
 	}
-	var data []modelEntry
+	data := make([]modelEntry, 0)
 	for _, m := range s.catalog.GetAllModels() {
-		if !s.modelRoutable(m.Provider, m.Model) {
+		if !s.modelAdvertised(m.Provider, m.Model) {
 			continue
 		}
-		data = append(data, modelEntry{ID: canonicalModelID(m.Provider, m.Model), Object: "model", Created: s.started.Unix(), OwnedBy: m.Provider, Provenance: string(m.Info.Provenance()), Health: string(m.HealthStatus), CooldownUntil: m.CooldownUntil, ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput, TokenCost: m.TokenCost, Thinking: m.Thinking, Vision: m.Vision, ToolUse: m.ToolUse, Effort: append([]string(nil), m.Effort...), CatalogSource: m.CatalogSource})
+		if functionalOnly && !s.modelRoutable(m.Provider, m.Model) {
+			continue
+		}
+		var cooldownUntil *time.Time
+		if !m.CooldownUntil.IsZero() {
+			value := m.CooldownUntil
+			cooldownUntil = &value
+		}
+		data = append(data, modelEntry{ID: canonicalModelID(m.Provider, m.Model), Object: "model", Created: s.started.Unix(), OwnedBy: m.Provider, Provenance: string(m.Info.Provenance()), Health: string(s.reportedModelHealth(m.Provider, m.Model, m.HealthStatus)), Classifications: classifyModel(m), CooldownUntil: cooldownUntil, ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput, TokenCost: m.TokenCost, Thinking: m.Thinking, Vision: m.Vision, ToolUse: m.ToolUse, Capabilities: wireModelCapabilities(m.ToolUse), Effort: append([]string(nil), m.Effort...), Kind: m.Info.Kind, Modalities: append([]string(nil), m.Info.Modalities...), CatalogSource: m.CatalogSource})
 	}
 	for _, list := range s.allModelLists() {
 		members := s.functionalModelListMembers(list)
 		if len(members) > 0 {
-			data = append(data, modelEntry{ID: list.Name, Object: "model", Created: s.started.Unix(), OwnedBy: "ghrouter", Provenance: string(types.ModelProvenanceConfigured), CatalogSource: "generated", List: true, Members: members})
+			toolUse := strings.EqualFold(list.Name, "ghrouter/tool-use")
+			data = append(data, modelEntry{ID: list.Name, Object: "model", Created: s.started.Unix(), OwnedBy: "ghrouter", Provenance: string(types.ModelProvenanceConfigured), CatalogSource: "generated", ToolUse: toolUse, Capabilities: wireModelCapabilities(toolUse), List: true, Members: members})
 		}
 	}
 	sort.Slice(data, func(i, j int) bool { return data[i].ID < data[j].ID })
 	json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
 
+func wireModelCapabilities(toolUse bool) map[string]any {
+	if !toolUse {
+		return nil
+	}
+	return map[string]any{"supports": map[string]bool{"tools": true}}
+}
+
 func (s *Server) ModelSummaries() []ModelSummary {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.modelSummaries()
+}
+
+func (s *Server) modelSummaries() []ModelSummary {
 	out := make([]ModelSummary, 0)
 	for _, m := range s.catalog.GetAllModels() {
 		out = append(out, ModelSummary{
-			ID:            canonicalModelID(m.Provider, m.Model),
-			OwnedBy:       m.Provider,
-			Provenance:    string(m.Info.Provenance()),
-			CostTier:      string(m.CostTier),
-			Capabilities:  stringifyCaps(m.Capabilities),
-			Slots:         stringifySlots(m.VirtualSlots),
-			Health:        string(m.HealthStatus),
-			LatencyMs:     m.LatencyP50.Milliseconds(),
-			CooldownUntil: m.CooldownUntil,
-			TokenCost:     m.TokenCost,
-			MaxTokens:     m.MaxTokens,
-			ContextWindow: m.ContextWindow,
-			MaxOutput:     m.MaxOutput,
-			Thinking:      m.Thinking,
-			Vision:        m.Vision,
-			ToolUse:       m.ToolUse,
-			Effort:        append([]string(nil), m.Effort...),
-			CatalogSource: m.CatalogSource,
+			ID:              canonicalModelID(m.Provider, m.Model),
+			OwnedBy:         m.Provider,
+			Provenance:      string(m.Info.Provenance()),
+			CostTier:        string(m.CostTier),
+			Capabilities:    stringifyCaps(m.Capabilities),
+			Classifications: classifyModel(m),
+			Slots:           stringifySlots(m.VirtualSlots),
+			Health:          string(s.reportedModelHealth(m.Provider, m.Model, m.HealthStatus)),
+			LatencyMs:       m.LatencyP50.Milliseconds(),
+			LatencyP95Ms:    m.LatencyP95.Milliseconds(),
+			CooldownUntil:   m.CooldownUntil,
+			TokenCost:       m.TokenCost,
+			MaxTokens:       m.MaxTokens,
+			ContextWindow:   m.ContextWindow,
+			MaxOutput:       m.MaxOutput,
+			Thinking:        m.Thinking,
+			Vision:          m.Vision,
+			ToolUse:         m.ToolUse,
+			Effort:          append([]string(nil), m.Effort...),
+			Kind:            m.Info.Kind,
+			Modalities:      append([]string(nil), m.Info.Modalities...),
+			CatalogSource:   m.CatalogSource,
 		})
 	}
 	for _, list := range s.allModelLists() {
 		members := s.functionalModelListMembers(list)
 		if len(members) > 0 {
-			out = append(out, ModelSummary{ID: list.Name, OwnedBy: "ghrouter", Provenance: string(types.ModelProvenanceConfigured), Health: "virtual", CatalogSource: "generated", List: true, Members: members})
+			out = append(out, ModelSummary{ID: list.Name, OwnedBy: "ghrouter", Provenance: string(types.ModelProvenanceConfigured), Health: "virtual", CatalogSource: "generated", ToolUse: strings.EqualFold(list.Name, "ghrouter/tool-use"), List: true, Members: members})
 		}
 	}
 	return out
 }
 
-func (s *Server) providerAuthenticated(providerName string) bool {
-	for _, provider := range s.cfg.Providers {
-		if provider != nil && provider.Name == providerName {
-			return local_brain.AuthReason(provider) == ""
-		}
-	}
-	return false
+func (s *Server) FunctionalModelSummaries() []ModelSummary {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
+	return s.functionalModelSummaries()
 }
 
-func (s *Server) FunctionalModelSummaries() []ModelSummary {
-	all := s.ModelSummaries()
+func (s *Server) functionalModelSummaries() []ModelSummary {
+	all := s.modelSummaries()
 	out := make([]ModelSummary, 0, len(all))
 	for _, model := range all {
-		if model.List || s.modelRoutable(model.OwnedBy, strings.TrimPrefix(model.ID, model.OwnedBy+"/")) {
+		if model.List {
 			out = append(out, model)
+			continue
 		}
+		if model.ID == "" || model.OwnedBy == "" {
+			continue
+		}
+		modelName := strings.TrimPrefix(model.ID, model.OwnedBy+"/")
+		advertised := s.modelAdvertised(model.OwnedBy, modelName)
+		configuredVerifiedLocal := strings.EqualFold(model.OwnedBy, "local-brain") && model.Health == string(health.HealthHealthy) && s.modelVerified(model.OwnedBy, modelName)
+		if s.configPath != "" && !advertised && !configuredVerifiedLocal {
+			continue
+		}
+		out = append(out, model)
 	}
 	return out
 }
@@ -2248,8 +3641,9 @@ func (s *Server) functionalModelListMembers(list types.ModelList) []string {
 			if !s.modelVerified(provider, model) {
 				continue
 			}
-			if !containsString(members, leaf) {
-				members = append(members, leaf)
+			canonical := canonicalModelID(provider, model)
+			if !containsString(members, canonical) {
+				members = append(members, canonical)
 			}
 		}
 	}
@@ -2322,6 +3716,8 @@ func (s *Server) controlPlaneSummaries() ([]ConnectionSummary, []PoolSummary, []
 }
 
 func (s *Server) LiveSnapshot() LiveSnapshot {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2329,12 +3725,13 @@ func (s *Server) LiveSnapshot() LiveSnapshot {
 		ListenPort:  s.cfg.ListenPort,
 		StartedAt:   s.started,
 		ClientKeys:  s.clientKeys.Masked(),
-		Models:      s.FunctionalModelSummaries(),
+		Models:      s.functionalModelSummaries(),
 		ModelLists:  s.modelListSummaries(),
 		Slots:       s.slotSummaries(),
 		Health:      s.healthSnapshotLocked(),
 		Telemetry:   s.telemetry.snapshot(),
 		Persistence: s.persistenceStatus(),
+		Storage:     s.persistenceStats(),
 	}
 	summary.Connections, summary.Pools, summary.Combos = s.controlPlaneSummaries()
 	for _, p := range s.cfg.Providers {
@@ -2344,10 +3741,10 @@ func (s *Server) LiveSnapshot() LiveSnapshot {
 		healthState := "unknown"
 		available := false
 		authState := "ok"
-		if reason := local_brain.AuthReason(p); reason != "" {
+		if ready, reason := s.providerAuthStatus(p); !ready {
 			authState = reason
 		}
-		if strings.TrimSpace(p.CLIPath) == "" {
+		if strings.TrimSpace(p.CLIPath) == "" && strings.TrimSpace(p.BaseURL) == "" {
 			healthState = "unavailable"
 			authState = "missing CLI on PATH"
 		}
@@ -2358,30 +3755,146 @@ func (s *Server) LiveSnapshot() LiveSnapshot {
 		}
 		accountState := account.Load(p)
 		summary.Providers = append(summary.Providers, ProviderSnapshot{
-			Name:      p.Name,
-			Type:      string(p.Type),
-			CLIPath:   p.CLIPath,
-			Models:    s.visibleProviderModels(p.Name),
-			Available: available,
-			Health:    healthState,
-			Auth:      authState,
-			Account:   accountState,
-			Discovery: p.Discovery,
+			Name:          p.Name,
+			Type:          string(p.Type),
+			CLIPath:       p.CLIPath,
+			Models:        s.visibleProviderModels(p.Name),
+			CatalogModels: s.catalogProviderModels(p.Name),
+			Available:     available,
+			Health:        healthState,
+			Auth:          authState,
+			Account:       accountState,
+			Discovery:     p.Discovery,
+			Harness:       p.Harness,
 		})
 	}
+	summary.Graph = s.buildRoutingGraph(summary)
 	return summary
+}
+
+func (s *Server) buildRoutingGraph(snapshot LiveSnapshot) RoutingGraphSnapshot {
+	graph := RoutingGraphSnapshot{Nodes: make([]RoutingGraphNode, 0), Edges: make([]RoutingGraphEdge, 0), Legend: []RoutingGraphLegend{
+		{Status: "available", Color: "green"},
+		{Status: "unavailable", Color: "red"},
+		{Status: "cooldown", Color: "blue"},
+		{Status: "degraded", Color: "yellow"},
+		{Status: "unknown", Color: "gray"},
+		{Status: "virtual", Color: "cyan"},
+	}}
+	seenNodes := make(map[string]bool)
+	addNode := func(node RoutingGraphNode) {
+		if node.ID == "" || seenNodes[node.ID] {
+			return
+		}
+		seenNodes[node.ID] = true
+		graph.Nodes = append(graph.Nodes, node)
+	}
+	addEdge := func(from, to, relation string) {
+		if from == "" || to == "" {
+			return
+		}
+		graph.Edges = append(graph.Edges, RoutingGraphEdge{From: from, To: to, Relation: relation})
+	}
+	addNode(RoutingGraphNode{ID: "brain", Kind: "brain", Label: "GHROUTER BRAIN", Status: "available"})
+	for _, client := range []string{"gh-copilot", "claude-code", "cursor", "opencode", "mimo", "pi"} {
+		id := "client/" + client
+		addNode(RoutingGraphNode{ID: id, Kind: "client", Label: client, Status: "configured"})
+		addEdge(id, "brain", "request")
+	}
+	for _, provider := range snapshot.Providers {
+		id := "provider/" + provider.Name
+		addNode(RoutingGraphNode{ID: id, Kind: "provider", Label: provider.Name, Status: routingGraphStatus(provider.Health, provider.Available, time.Time{})})
+		addEdge("brain", id, "select")
+	}
+	for _, model := range s.ModelSummaries() {
+		if model.List {
+			continue
+		}
+		id := "model/" + model.ID
+		latency := snapshot.Telemetry.ModelLatency[model.ID]
+		addNode(RoutingGraphNode{ID: id, Kind: "model", Label: model.ID, Status: routingGraphStatus(model.Health, false, model.CooldownUntil), Provider: model.OwnedBy, Model: model.ID, CooldownUntil: model.CooldownUntil, LatencyMs: latency.P50Ms, LatencyP95Ms: latency.P95Ms, LatencySamples: latency.Samples})
+		addEdge("brain", id, "route")
+		addEdge("provider/"+model.OwnedBy, id, "exposes")
+	}
+	for _, list := range s.allModelLists() {
+		id := "list/" + list.Name
+		kind := list.Kind
+		if kind == "" {
+			kind = "list"
+		}
+		status := "virtual"
+		if len(s.functionalModelListMembers(list)) == 0 {
+			status = "unavailable"
+		}
+		addNode(RoutingGraphNode{ID: id, Kind: kind, Label: list.Name, Status: status})
+		addEdge("brain", id, "select")
+		members := list.Models
+		for _, member := range members {
+			modelID := "model/" + member
+			if seenNodes[modelID] {
+				addEdge(id, modelID, "member")
+			}
+		}
+	}
+	for _, route := range s.cfg.Routes {
+		if route == nil || route.Pattern == "" {
+			continue
+		}
+		id := "route/" + route.Pattern
+		addNode(RoutingGraphNode{ID: id, Kind: "route", Label: route.Pattern, Status: "configured"})
+		addEdge("brain", id, "match")
+		if route.Provider != "" {
+			addEdge(id, "provider/"+route.Provider, "target")
+		}
+	}
+	return graph
+}
+
+func routingGraphStatus(status string, available bool, cooldownUntil time.Time) string {
+	if !cooldownUntil.IsZero() && time.Now().Before(cooldownUntil) {
+		return "cooldown"
+	}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "healthy", "available":
+		return "available"
+	case "unhealthy", "unavailable", "failed":
+		return "unavailable"
+	case "cooldown":
+		return "cooldown"
+	case "degraded":
+		return "degraded"
+	default:
+		if available {
+			return "available"
+		}
+		return "unknown"
+	}
 }
 
 func (s *Server) persistenceStatus() string {
 	s.storageMu.RLock()
-	defer s.storageMu.RUnlock()
-	if s.storageErr != "" {
-		return "degraded: " + s.storageErr
+	storageErr := s.storageErr
+	store := s.store
+	s.storageMu.RUnlock()
+	if storageErr != "" {
+		return "degraded: " + storageErr
 	}
-	if s.store != nil {
+	if store != nil {
+		if err := store.Check(); err != nil {
+			return "degraded: sqlite check failed"
+		}
 		return "sqlite"
 	}
 	return "disabled"
+}
+
+func (s *Server) persistenceStats() *storage.Stats {
+	store := s.getStore()
+	if store == nil {
+		return nil
+	}
+	stats := store.Stats()
+	return &stats
 }
 
 func (s *Server) setStore(store *storage.Store) {
@@ -2411,6 +3924,7 @@ func (s *Server) persistStorageState() error {
 		return storage.ErrStoreClosed
 	}
 	providers := make([]storage.ProviderRecord, 0, len(s.cfg.Providers))
+	providerIDs := make(map[string]struct{}, len(s.cfg.Providers))
 	for _, provider := range s.cfg.Providers {
 		if provider == nil || !provider.Enabled {
 			continue
@@ -2422,16 +3936,26 @@ func (s *Server) persistStorageState() error {
 		providers = append(providers, storage.ProviderRecord{
 			ProviderID: provider.Name, CLIType: string(provider.Type), Executable: provider.CLIPath, AuthState: authState,
 		})
+		providerIDs[provider.Name] = struct{}{}
 	}
 	models := make([]storage.ModelRecord, 0)
 	for _, model := range s.catalog.GetAllModels() {
+		if _, ok := providerIDs[model.Provider]; !ok {
+			cliType := "catalog"
+			if model.Provider == "local-brain" {
+				cliType = string(types.ProviderLocal)
+			}
+			providers = append(providers, storage.ProviderRecord{ProviderID: model.Provider, CLIType: cliType, AuthState: "observed"})
+			providerIDs[model.Provider] = struct{}{}
+		}
 		models = append(models, storage.ModelRecord{
 			ModelID: model.Provider + "/" + model.Model, ProviderID: model.Provider,
-			Capabilities: stringifyCaps(model.Capabilities), Slots: stringifySlots(model.VirtualSlots),
+			Capabilities: stringifyCaps(model.Capabilities), Slots: stringifySlots(model.VirtualSlots), DiscoveredAt: model.Info.DiscoveredAt, VerifiedAt: model.Info.VerifiedAt, VerificationErr: model.Info.VerificationError,
 			CatalogSource: model.CatalogSource, Effort: append([]string(nil), model.Effort...),
-			HealthState: string(model.HealthStatus), MaxTokens: model.MaxTokens,
+			HealthState: string(model.HealthStatus), CostTier: string(model.CostTier), MaxTokens: model.MaxTokens,
 			TokenCost: model.TokenCost, ContextWindow: model.ContextWindow, MaxOutput: model.MaxOutput,
 			Thinking: model.Thinking, Vision: model.Vision, ToolUse: model.ToolUse,
+			LatencyP50: model.LatencyP50, LatencyP95: model.LatencyP95,
 			CooldownUntil: model.CooldownUntil, FailureCount: model.FailureCount,
 			ErrorRate: model.ErrorRate, LastHealthCheck: model.LastHealthCheck,
 		})
@@ -2510,7 +4034,13 @@ func (s *Server) restoreCatalogState(store *storage.Store) error {
 		return err
 	}
 	for _, record := range records {
-		s.catalog.RestoreModelMetadata(record.ModelID, record.CatalogSource, record.Capabilities, record.Effort, record.TokenCost, record.ContextWindow, record.MaxOutput, record.Thinking, record.Vision, record.ToolUse)
+		toolUse := record.ToolUse
+		if current := s.catalog.GetModel(record.ModelID); current != nil {
+			toolUse = current.ToolUse
+		}
+		s.catalog.RestoreModelMetadata(record.ModelID, record.CatalogSource, record.CostTier, record.Capabilities, record.Effort, record.TokenCost, record.ContextWindow, record.MaxOutput, record.Thinking, record.Vision, toolUse, record.DiscoveredAt)
+		s.catalog.RestoreModelVerification(record.ModelID, record.VerifiedAt, record.VerificationErr)
+		s.catalog.RestoreModelLatency(record.ModelID, record.LatencyP50, record.LatencyP95)
 		s.catalog.RestoreModelState(record.ModelID, health.HealthStatus(record.HealthState), record.CooldownUntil, record.LastHealthCheck, record.FailureCount, record.ErrorRate)
 	}
 	return nil
@@ -2547,24 +4077,26 @@ func (s *Server) slotSummaries() map[string]ModelSummary {
 	} {
 		if m := s.catalog.GetModelBySlot(slot); m != nil {
 			out[string(slot)] = ModelSummary{
-				ID:            canonicalModelID(m.Provider, m.Model),
-				OwnedBy:       m.Provider,
-				Provenance:    string(m.Info.Provenance()),
-				CostTier:      string(m.CostTier),
-				Capabilities:  stringifyCaps(m.Capabilities),
-				Slots:         stringifySlots(m.VirtualSlots),
-				Health:        string(m.HealthStatus),
-				LatencyMs:     m.LatencyP50.Milliseconds(),
-				CooldownUntil: m.CooldownUntil,
-				TokenCost:     m.TokenCost,
-				MaxTokens:     m.MaxTokens,
-				ContextWindow: m.ContextWindow,
-				MaxOutput:     m.MaxOutput,
-				Thinking:      m.Thinking,
-				Vision:        m.Vision,
-				ToolUse:       m.ToolUse,
-				Effort:        append([]string(nil), m.Effort...),
-				CatalogSource: m.CatalogSource,
+				ID:              canonicalModelID(m.Provider, m.Model),
+				OwnedBy:         m.Provider,
+				Provenance:      string(m.Info.Provenance()),
+				CostTier:        string(m.CostTier),
+				Capabilities:    stringifyCaps(m.Capabilities),
+				Classifications: classifyModel(m),
+				Slots:           stringifySlots(m.VirtualSlots),
+				Health:          string(m.HealthStatus),
+				LatencyMs:       m.LatencyP50.Milliseconds(),
+				LatencyP95Ms:    m.LatencyP95.Milliseconds(),
+				CooldownUntil:   m.CooldownUntil,
+				TokenCost:       m.TokenCost,
+				MaxTokens:       m.MaxTokens,
+				ContextWindow:   m.ContextWindow,
+				MaxOutput:       m.MaxOutput,
+				Thinking:        m.Thinking,
+				Vision:          m.Vision,
+				ToolUse:         m.ToolUse,
+				Effort:          append([]string(nil), m.Effort...),
+				CatalogSource:   m.CatalogSource,
 			}
 		}
 	}
@@ -2588,6 +4120,8 @@ func stringifySlots(slots []catalog.VirtualSlot) []string {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	summary := s.healthSnapshot()
 	resp := HealthResponse{
@@ -2595,7 +4129,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Uptime:        time.Since(s.started),
 		Health:        summary,
 		ProviderCount: len(s.cfg.Providers),
-		ModelCount:    len(s.FunctionalModelSummaries()),
+		ModelCount:    len(s.functionalModelSummaries()),
+		BinarySHA256:  runningBinarySHA256(),
 	}
 	json.NewEncoder(w).Encode(resp)
 }
@@ -2606,6 +4141,8 @@ func (s *Server) handleLiveness(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleReadiness(w http.ResponseWriter, _ *http.Request) {
+	s.configMu.RLock()
+	defer s.configMu.RUnlock()
 	summary := s.healthSnapshot()
 	ready := false
 	for _, provider := range s.cfg.Providers {
@@ -2618,7 +4155,7 @@ func (s *Server) handleReadiness(w http.ResponseWriter, _ *http.Request) {
 			break
 		}
 	}
-	if ready && len(s.FunctionalModelSummaries()) == 0 {
+	if ready && (len(s.functionalModelSummaries()) == 0 || !s.hasVerifiedHealthyModel()) {
 		ready = false
 	}
 	status := http.StatusOK
@@ -2632,22 +4169,66 @@ func (s *Server) handleReadiness(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": state, "health": summary, "persistence": s.persistenceStatus()})
 }
 
+func (s *Server) hasVerifiedHealthyModel() bool {
+	if s == nil || s.catalog == nil {
+		return false
+	}
+	for _, entry := range s.catalog.GetAllModels() {
+		if entry == nil || entry.HealthStatus != health.HealthHealthy {
+			continue
+		}
+		if s.modelVerified(entry.Provider, entry.Model) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	bootstrapper, err := local_brain.NewBootstrapper()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "bootstrap_failed", err.Error())
-		return
-	}
-	report, _ := bootstrapper.Check(s.cfg.Providers)
-	response := LiveResponse{Snapshot: s.LiveSnapshot(), Bootstrap: report.Summary()}
+	response := LiveResponse{Snapshot: s.LiveSnapshot(), Bootstrap: s.bootstrapSnapshot()}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		return
 	}
+}
+
+func (s *Server) bootstrapSnapshot() local_brain.BootstrapSummary {
+	s.bootstrapMu.Lock()
+	defer s.bootstrapMu.Unlock()
+	if s.bootstrapAt.IsZero() {
+		s.bootstrap = local_brain.BootstrapSummary{Suggestions: []string{"bootstrap check pending"}}
+	}
+	if !s.bootstrapRunning && (s.bootstrapAt.IsZero() || time.Since(s.bootstrapAt) >= 30*time.Second) {
+		s.bootstrapRunning = true
+		s.mu.RLock()
+		providers := append([]*types.Provider(nil), s.cfg.Providers...)
+		s.mu.RUnlock()
+		go s.refreshBootstrap(providers)
+	}
+	return s.bootstrap
+}
+
+func (s *Server) refreshBootstrap(providers []*types.Provider) {
+	bootstrapper, err := local_brain.NewBootstrapper()
+	var summary local_brain.BootstrapSummary
+	if err != nil {
+		summary.Suggestions = []string{"bootstrap diagnostics unavailable"}
+	} else {
+		report, checkErr := bootstrapper.Check(providers)
+		summary = report.Summary()
+		if checkErr != nil && len(summary.Suggestions) == 0 {
+			summary.Suggestions = []string{"bootstrap prerequisites require attention"}
+		}
+	}
+	s.bootstrapMu.Lock()
+	s.bootstrap = summary
+	s.bootstrapAt = time.Now()
+	s.bootstrapRunning = false
+	s.bootstrapMu.Unlock()
 }
 
 func (s *Server) healthSnapshot() HealthSnapshot {
@@ -2658,6 +4239,9 @@ func (s *Server) healthSnapshot() HealthSnapshot {
 
 func (s *Server) healthSnapshotLocked() HealthSnapshot {
 	summary := HealthSnapshot{Providers: make(map[string]HealthState)}
+	if s.brainAdmission != nil {
+		summary.Resource = s.brainAdmission.Snapshot()
+	}
 	if s.health == nil {
 		return summary
 	}
@@ -2667,8 +4251,22 @@ func (s *Server) healthSnapshotLocked() HealthSnapshot {
 		}
 		result := s.health.GetHealth(p.Name)
 		if result == nil {
-			summary.Unknown++
-			summary.Providers[p.Name] = HealthState{Status: string(health.HealthUnknown)}
+			state := HealthState{Status: string(health.HealthUnknown)}
+			if runner := s.providers[p.Name]; runner != nil {
+				runnerHealth := runner.GetHealth()
+				if runnerHealth.Status == "circuit_open" || runnerHealth.Status == "half_open" {
+					state.Status = runnerHealth.Status
+					if runnerHealth.Error != nil {
+						state.Error = publicProviderError(runnerHealth.Error)
+					}
+				}
+			}
+			if state.Status == "circuit_open" {
+				summary.CircuitOpen++
+			} else {
+				summary.Unknown++
+			}
+			summary.Providers[p.Name] = state
 			continue
 		}
 		state := HealthState{
@@ -2679,7 +4277,59 @@ func (s *Server) healthSnapshotLocked() HealthSnapshot {
 		if result.Error != nil {
 			state.Error = publicProviderError(result.Error)
 		}
-		switch result.Status {
+		if runner := s.providers[p.Name]; runner != nil {
+			runnerHealth := runner.GetHealth()
+			if runnerHealth.Status == "circuit_open" || runnerHealth.Status == "half_open" {
+				state.Status = runnerHealth.Status
+				if runnerHealth.Error != nil {
+					state.Error = publicProviderError(runnerHealth.Error)
+				}
+			}
+		}
+		switch state.Status {
+		case string(health.HealthHealthy):
+			summary.Healthy++
+		case string(health.HealthDegraded):
+			summary.Degraded++
+		case string(health.HealthUnhealthy):
+			summary.Unhealthy++
+		case string(health.HealthCooldown):
+			summary.Cooldown++
+		default:
+			if state.Status == "circuit_open" {
+				summary.CircuitOpen++
+			} else {
+				summary.Unknown++
+			}
+		}
+		summary.Providers[p.Name] = state
+	}
+	summary.Models = s.modelReadinessLocked()
+	return summary
+}
+
+func (s *Server) modelReadinessLocked() ModelReadiness {
+	var summary ModelReadiness
+	if s == nil || s.catalog == nil {
+		return summary
+	}
+	for _, entry := range s.catalog.GetAllModels() {
+		if entry == nil {
+			continue
+		}
+		summary.Catalog++
+		verified := s.modelVerified(entry.Provider, entry.Model)
+		if verified {
+			summary.Verified++
+		}
+		status := entry.HealthStatus
+		if status == health.HealthHealthy && s.configPath != "" && !verified {
+			status = health.HealthUnknown
+		}
+		if verified && status == health.HealthHealthy {
+			summary.VerifiedHealthy++
+		}
+		switch status {
 		case health.HealthHealthy:
 			summary.Healthy++
 		case health.HealthDegraded:
@@ -2691,7 +4341,6 @@ func (s *Server) healthSnapshotLocked() HealthSnapshot {
 		default:
 			summary.Unknown++
 		}
-		summary.Providers[p.Name] = state
 	}
 	return summary
 }
@@ -2711,7 +4360,7 @@ func prefixFor(provider types.ProviderType) string {
 	m := map[types.ProviderType]string{
 		types.ProviderClaudeCode: "cc/", types.ProviderCodex: "cx/",
 		types.ProviderOpenCode: "oc/", types.ProviderMimo: "mi/", types.ProviderPi: "pi/",
-		types.ProviderCursor: "cu/",
+		types.ProviderCursor: "cu/", types.ProviderNVIDIA: "nv/",
 	}
 	return m[provider]
 }
@@ -2722,7 +4371,7 @@ func canonicalModelID(provider, model string) string {
 	if model == "" {
 		return ""
 	}
-	for _, prefix := range []string{"cc/", "cx/", "oc/", "mi/", "pi/", "cu/"} {
+	for _, prefix := range []string{"cc/", "cx/", "oc/", "mi/", "pi/", "cu/", "nv/"} {
 		if strings.HasPrefix(model, prefix) {
 			return model
 		}
@@ -2762,6 +4411,8 @@ func canonicalPrefixForProviderName(provider string) string {
 		return "pi/"
 	case "cursor":
 		return "cu/"
+	case "nvidia":
+		return "nv/"
 	default:
 		return ""
 	}
@@ -2772,7 +4423,7 @@ func buildCatalogModels(p *types.Provider) []*catalog.ModelEntry {
 	accountState := account.Load(p)
 	weight := account.Weight(accountState)
 	for _, model := range p.Models {
-		metadata := p.ModelInfo[model]
+		metadata, _ := modelInfoForProvider(p, model)
 		metadata.Provider = p.Name
 		metadata.Model = model
 		if strings.TrimSpace(metadata.Source) == "" {
@@ -2797,6 +4448,11 @@ func buildCatalogModels(p *types.Provider) []*catalog.ModelEntry {
 			status = health.HealthUnknown
 			verifiedAt = time.Time{}
 		}
+		toolUse := metadata.ToolUse
+		if !toolUse && p.Type == types.ProviderCodex && strings.EqualFold(metadata.Source, "native") {
+			toolUse = true
+		}
+		metadata.ToolUse = toolUse
 		capabilities := modelCapabilities(model, metadata)
 		models = append(models, &catalog.ModelEntry{
 			ID:              canonicalModelID(p.Name, model),
@@ -2811,7 +4467,7 @@ func buildCatalogModels(p *types.Provider) []*catalog.ModelEntry {
 			MaxOutput:       metadata.MaxOutput,
 			Thinking:        metadata.Thinking,
 			Vision:          metadata.Vision,
-			ToolUse:         metadata.ToolUse,
+			ToolUse:         toolUse,
 			Effort:          append([]string(nil), metadata.Effort...),
 			CatalogSource:   metadata.Source,
 			Info:            metadata,
@@ -2821,6 +4477,42 @@ func buildCatalogModels(p *types.Provider) []*catalog.ModelEntry {
 		})
 	}
 	return models
+}
+
+func classifyModel(model *catalog.ModelEntry) []string {
+	if model == nil {
+		return nil
+	}
+	classes := []string{
+		"cost:" + string(model.CostTier),
+		"state:" + string(model.HealthStatus),
+		"provenance:" + string(model.Info.Provenance()),
+	}
+	if model.Info.Kind != "" {
+		classes = append(classes, "kind:"+model.Info.Kind)
+	}
+	for _, modality := range model.Info.Modalities {
+		classes = append(classes, "modality:"+modality)
+	}
+	for _, capability := range model.Capabilities {
+		classes = append(classes, "capability:"+string(capability))
+	}
+	if model.LatencyP50 <= 0 {
+		classes = append(classes, "latency:unknown")
+	} else if model.LatencyP50 < 2*time.Second {
+		classes = append(classes, "latency:fast", "latency:observed")
+	} else {
+		classes = append(classes, "latency:measured", "latency:observed")
+	}
+	if model.ContextWindow >= 128000 {
+		classes = append(classes, "context:long")
+	} else if model.ContextWindow > 0 {
+		classes = append(classes, "context:standard")
+	} else {
+		classes = append(classes, "context:unknown")
+	}
+	sort.Strings(classes)
+	return classes
 }
 
 func modelCapabilities(model string, metadata types.ModelInfo) []catalog.CapabilityTag {
@@ -2851,6 +4543,12 @@ func modelCapabilities(model string, metadata types.ModelInfo) []catalog.Capabil
 	if metadata.ToolUse {
 		add(catalog.CapabilityToolUse)
 	}
+	switch metadata.Kind {
+	case "coding":
+		add(catalog.CapabilityCode)
+	case "multimodal":
+		add(catalog.CapabilityVision)
+	}
 	if strings.Contains(strings.ToLower(model), "code") || strings.Contains(strings.ToLower(model), "coder") {
 		add(catalog.CapabilityCode)
 	}
@@ -2858,11 +4556,20 @@ func modelCapabilities(model string, metadata types.ModelInfo) []catalog.Capabil
 }
 
 func modelCostTier(metadata types.ModelInfo) catalog.CostTier {
-	if metadata.TokenCost == 0 && metadata.ContextWindow == 0 {
+	switch strings.ToLower(strings.TrimSpace(metadata.CostTier)) {
+	case string(catalog.CostFree):
 		return catalog.CostFree
+	case string(catalog.CostCheap):
+		return catalog.CostCheap
+	case string(catalog.CostStandard):
+		return catalog.CostStandard
+	case string(catalog.CostPremium):
+		return catalog.CostPremium
+	case string(catalog.CostUnknown):
+		return catalog.CostUnknown
 	}
 	if metadata.TokenCost <= 0 {
-		return catalog.CostStandard
+		return catalog.CostUnknown
 	}
 	if metadata.TokenCost < 500 {
 		return catalog.CostCheap

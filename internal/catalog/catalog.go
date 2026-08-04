@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ const (
 	CostCheap    CostTier = "cheap"
 	CostStandard CostTier = "standard"
 	CostPremium  CostTier = "premium"
+	CostUnknown  CostTier = "unknown"
 )
 
 // VirtualSlot represents a virtual model slot for gh copilot
@@ -74,6 +76,7 @@ type ModelEntry struct {
 	CatalogSource   string
 	ProviderWeight  float64
 	FailureCount    int
+	latencySamples  []time.Duration
 }
 
 // Catalog maintains a live catalog of available models
@@ -102,9 +105,10 @@ var providerPrefixes = map[string]string{
 	"mimo":        "mi",
 	"pi":          "pi",
 	"cursor":      "cu",
+	"nvidia":      "nv",
 }
 
-var canonicalPrefixes = []string{"cc/", "cx/", "oc/", "mi/", "pi/", "cu/"}
+var canonicalPrefixes = []string{"cc/", "cx/", "oc/", "mi/", "pi/", "cu/", "nv/"}
 
 func NewCatalog(healthLoop *health.Loop, ttl time.Duration) *Catalog {
 	if ttl == 0 {
@@ -227,6 +231,13 @@ func (c *Catalog) RegisterProvider(provider string, models []*ModelEntry) {
 			}
 			m.FailureCount = old.FailureCount
 			m.ErrorRate = old.ErrorRate
+			m.latencySamples = append([]time.Duration(nil), old.latencySamples...)
+			if m.LatencyP50 == 0 {
+				m.LatencyP50 = old.LatencyP50
+			}
+			if m.LatencyP95 == 0 {
+				m.LatencyP95 = old.LatencyP95
+			}
 		}
 		c.models[id] = m
 		c.byProvider[provider] = append(c.byProvider[provider], id)
@@ -260,6 +271,42 @@ func (c *Catalog) GetModel(id string) *ModelEntry {
 		return &copy
 	}
 	return nil
+}
+
+func (c *Catalog) RecordLatency(modelID string, latency time.Duration) {
+	if latency <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	modelID = canonicalModelID("", modelID)
+	m, ok := c.models[modelID]
+	if !ok {
+		return
+	}
+	m.latencySamples = append(m.latencySamples, latency)
+	if len(m.latencySamples) > 128 {
+		m.latencySamples = append([]time.Duration(nil), m.latencySamples[len(m.latencySamples)-128:]...)
+	}
+	samples := append([]time.Duration(nil), m.latencySamples...)
+	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+	m.LatencyP50 = percentileLatency(samples, 0.50)
+	m.LatencyP95 = percentileLatency(samples, 0.95)
+	c.rebuildSlots()
+}
+
+func percentileLatency(samples []time.Duration, percentile float64) time.Duration {
+	if len(samples) == 0 {
+		return 0
+	}
+	index := int(math.Ceil(float64(len(samples))*percentile)) - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(samples) {
+		index = len(samples) - 1
+	}
+	return samples[index]
 }
 
 func (c *Catalog) GetModelBySlot(slot VirtualSlot) *ModelEntry {
@@ -385,6 +432,7 @@ func (c *Catalog) refreshExpiredCooldownsLocked(now time.Time) {
 			m.HealthStatus = health.HealthUnknown
 			m.CooldownUntil = time.Time{}
 			m.LastHealthCheck = time.Time{}
+			m.Info.VerifiedAt = time.Time{}
 			changed = true
 		}
 	}
@@ -416,6 +464,7 @@ func (c *Catalog) SetCooldown(modelID string, until time.Time) {
 			m.CooldownUntil = time.Time{}
 			m.HealthStatus = health.HealthUnknown
 			m.LastHealthCheck = time.Time{}
+			m.Info.VerifiedAt = time.Time{}
 		}
 		c.rebuildSlots()
 	}
@@ -439,13 +488,14 @@ func (c *Catalog) RestoreModelState(modelID string, status health.HealthStatus, 
 		m.CooldownUntil = time.Time{}
 		m.HealthStatus = health.HealthUnknown
 		m.LastHealthCheck = time.Time{}
+		m.Info.VerifiedAt = time.Time{}
 	} else if status != health.HealthUnknown {
 		m.HealthStatus = status
 	}
 	c.rebuildSlots()
 }
 
-func (c *Catalog) RestoreModelMetadata(modelID, source string, capabilities []string, effort []string, tokenCost, contextWindow, maxOutput int, thinking, vision, toolUse bool) {
+func (c *Catalog) RestoreModelMetadata(modelID, source, costTier string, capabilities []string, effort []string, tokenCost, contextWindow, maxOutput int, thinking, vision, toolUse bool, discoveredAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	modelID = canonicalModelID("", modelID)
@@ -455,6 +505,10 @@ func (c *Catalog) RestoreModelMetadata(modelID, source string, capabilities []st
 	}
 	m.CatalogSource = source
 	m.Info.Source = source
+	if !discoveredAt.IsZero() {
+		m.Info.DiscoveredAt = discoveredAt
+	}
+	m.CostTier = CostTier(costTier)
 	m.Capabilities = make([]CapabilityTag, 0, len(capabilities))
 	for _, capability := range capabilities {
 		m.Capabilities = append(m.Capabilities, CapabilityTag(capability))
@@ -466,6 +520,37 @@ func (c *Catalog) RestoreModelMetadata(modelID, source string, capabilities []st
 	m.Thinking = thinking
 	m.Vision = vision
 	m.ToolUse = toolUse
+	c.rebuildSlots()
+}
+
+func (c *Catalog) RestoreModelVerification(modelID string, verifiedAt time.Time, verificationError string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.models[canonicalModelID("", modelID)]
+	if m == nil {
+		return
+	}
+	if !verifiedAt.IsZero() {
+		m.Info.VerifiedAt = verifiedAt
+		m.Info.VerificationError = verificationError
+	} else if strings.TrimSpace(verificationError) != "" {
+		m.Info.VerificationError = verificationError
+	}
+}
+
+func (c *Catalog) RestoreModelLatency(modelID string, p50, p95 time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.models[canonicalModelID("", modelID)]
+	if m == nil {
+		return
+	}
+	if p50 > 0 {
+		m.LatencyP50 = p50
+	}
+	if p95 > 0 {
+		m.LatencyP95 = p95
+	}
 	c.rebuildSlots()
 }
 

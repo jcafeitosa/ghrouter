@@ -1,10 +1,15 @@
 package local_brain
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"ghrouter/internal/types"
 )
@@ -40,6 +45,7 @@ type ProvisionAction struct {
 
 type BootstrapReport struct {
 	Backend BackendType
+	Host    HostCapabilities
 	Issues  []BootstrapIssue
 	Checks  []StartupCheck
 }
@@ -47,11 +53,14 @@ type BootstrapReport struct {
 type BootstrapSummary struct {
 	Ready       bool              `json:"ready"`
 	Backend     BackendType       `json:"backend"`
+	Host        HostCapabilities  `json:"host"`
 	Issues      []BootstrapIssue  `json:"issues"`
 	Checks      []StartupCheck    `json:"checks"`
 	Provision   []ProvisionAction `json:"provision"`
 	Suggestions []string          `json:"suggestions"`
 }
+
+const nativeAuthStatusTimeout = 2 * time.Second
 
 func (r BootstrapReport) Ready() bool {
 	return len(r.Issues) == 0
@@ -77,6 +86,7 @@ func (r BootstrapReport) Summary() BootstrapSummary {
 	return BootstrapSummary{
 		Ready:       r.Ready(),
 		Backend:     r.Backend,
+		Host:        r.Host,
 		Issues:      issues,
 		Checks:      checks,
 		Provision:   buildProvisionPlan(r.Checks),
@@ -133,6 +143,9 @@ func (b *Bootstrapper) Check(providers []*types.Provider) (BootstrapReport, erro
 			return report, fmt.Errorf("prepare model cache: %w", err)
 		}
 	}
+	if detector, ok := b.Detector.(*Detector); ok {
+		report.Host = detector.HostCapabilities()
+	}
 
 	for _, p := range providers {
 		if p == nil || !p.Enabled {
@@ -152,6 +165,26 @@ func (b *Bootstrapper) Check(providers []*types.Provider) (BootstrapReport, erro
 			AuthOK:   AuthReason(p) == "",
 			ModelOK:  false,
 			Ready:    false,
+		}
+		if backend == BackendExternalCLI {
+			if reason := AuthReason(p); reason != "" {
+				check.Reason = reason
+				check.NextStep = nextStepForIssue(check.Reason, backend, check.Model, p)
+				report.Checks = append(report.Checks, check)
+				report.Issues = append(report.Issues, BootstrapIssue{Provider: p.Name, Backend: backend, Model: check.Model, Reason: reason})
+				continue
+			}
+			if check.Model == "" {
+				check.Reason = "no model configured"
+				check.NextStep = nextStepForIssue(check.Reason, backend, check.Model, p)
+				report.Checks = append(report.Checks, check)
+				report.Issues = append(report.Issues, BootstrapIssue{Provider: p.Name, Backend: backend, Reason: check.Reason})
+				continue
+			}
+			check.ModelOK = true
+			check.Ready = true
+			report.Checks = append(report.Checks, check)
+			continue
 		}
 		if !b.Detector.IsBackendAvailable(backend) {
 			check.Reason = fmt.Sprintf("%s backend unavailable", backend)
@@ -215,9 +248,15 @@ func (b *Bootstrapper) Check(providers []*types.Provider) (BootstrapReport, erro
 func backendForProvider(pt types.ProviderType) BackendType {
 	switch pt {
 	case types.ProviderClaudeCode, types.ProviderCodex, types.ProviderOpenCode, types.ProviderMimo:
-		return preferredBackendForHost()
+		return BackendExternalCLI
 	case types.ProviderPi:
-		return BackendMLX
+		return BackendExternalCLI
+	case types.ProviderCursor:
+		return BackendExternalCLI
+	case types.ProviderNVIDIA:
+		return BackendNone
+	case types.ProviderLocal:
+		return BackendNone
 	default:
 		return preferredBackendForHost()
 	}
@@ -247,31 +286,93 @@ func AuthReason(p *types.Provider) string {
 	}
 	switch p.Type {
 	case types.ProviderClaudeCode:
-		if os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") == "" {
-			return "missing Anthropic auth (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)"
+		if os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" && os.Getenv("CLAUDE_CODE_OAUTH_TOKEN") == "" && !credentialFileExists(p, ".claude/.credentials.json", ".config/claude/auth.json") && !nativeAuthStatus(p) {
+			return "missing Anthropic auth (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or CLAUDE_CODE_OAUTH_TOKEN)"
 		}
 	case types.ProviderCodex:
-		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("CODEX_HOME") == "" {
+		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("CODEX_HOME") == "" && !credentialFileExists(p, ".codex/auth.json", ".config/codex/auth.json") && !nativeAuthStatus(p) {
 			return "missing OpenAI auth (OPENAI_API_KEY or CODEX_HOME)"
 		}
 	case types.ProviderOpenCode:
-		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("OPENCODE_API_KEY") == "" {
+		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("OPENCODE_API_KEY") == "" && !credentialFileExists(p, ".local/share/opencode/auth.json", ".config/opencode/auth.json") {
 			return "missing OpenCode auth (OPENAI_API_KEY or OPENCODE_API_KEY)"
 		}
 	case types.ProviderMimo:
-		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("MIMO_API_KEY") == "" {
+		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("MIMO_API_KEY") == "" && !credentialFileExists(p, ".local/share/mimocode/auth.json", ".config/mimo/auth.json") {
 			return "missing Mimo auth (OPENAI_API_KEY or MIMO_API_KEY)"
 		}
 	case types.ProviderPi:
-		if os.Getenv("GOOGLE_API_KEY") == "" && os.Getenv("PI_API_KEY") == "" {
-			return "missing Pi auth (GOOGLE_API_KEY or PI_API_KEY)"
+		if os.Getenv("OPENAI_API_KEY") == "" && os.Getenv("GOOGLE_API_KEY") == "" && os.Getenv("PI_API_KEY") == "" && !credentialFileExists(p, ".pi/agent/auth.json", ".config/pi/auth.json") {
+			return "missing Pi auth (OPENAI_API_KEY, GOOGLE_API_KEY or PI_API_KEY)"
 		}
 	case types.ProviderCursor:
-		if os.Getenv("CURSOR_API_KEY") == "" {
+		if os.Getenv("CURSOR_API_KEY") == "" && !credentialFileExists(p, ".cursor/auth.json", ".config/cursor/auth.json") && !nativeAuthStatus(p) {
 			return "missing Cursor auth (CURSOR_API_KEY)"
 		}
 	}
 	return ""
+}
+
+func nativeAuthStatus(provider *types.Provider) bool {
+	if provider == nil || provider.CLIPath == "" {
+		return false
+	}
+	var args []string
+	switch provider.Type {
+	case types.ProviderClaudeCode:
+		args = []string{"auth", "status"}
+	case types.ProviderCodex:
+		args = []string{"login", "status"}
+	case types.ProviderCursor:
+		if filepath.Base(provider.CLIPath) == "agent" {
+			args = []string{"status"}
+		} else {
+			args = []string{"agent", "status"}
+		}
+	default:
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), nativeAuthStatusTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, provider.CLIPath, args...)
+	prepareAuthCommand(cmd)
+	output, err := runAuthCommand(ctx, cmd)
+	if err != nil || ctx.Err() != nil {
+		return false
+	}
+	if provider.Type == types.ProviderClaudeCode {
+		var status struct {
+			LoggedIn bool `json:"loggedIn"`
+		}
+		return json.Unmarshal(output, &status) == nil && status.LoggedIn
+	}
+	return strings.Contains(strings.ToLower(string(output)), "logged in")
+}
+
+func credentialFileExists(provider *types.Provider, relative ...string) bool {
+	if provider == nil {
+		return false
+	}
+	home := os.Getenv("HOME")
+	if home == "" {
+		return false
+	}
+	paths := make([]string, 0, len(relative)+1)
+	for _, path := range relative {
+		paths = append(paths, filepath.Join(home, path))
+	}
+	for _, envKey := range []string{"CODEX_HOME", "OPENCODE_HOME", "MIMO_HOME", "PI_HOME"} {
+		if root := os.Getenv(envKey); root != "" {
+			paths = append(paths, filepath.Join(root, "auth.json"))
+		}
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func suggestionsForIssues(issues []BootstrapIssue) []string {
@@ -329,14 +430,18 @@ func buildProvisionPlan(checks []StartupCheck) []ProvisionAction {
 		switch {
 		case strings.Contains(check.Reason, "backend unavailable"):
 			action.Action = "backend_setup"
+			action.ApplyOK = true
 			action.Command = backendSetupCommand(check.Backend)
 		case strings.Contains(check.Reason, "missing "):
 			action.Action = "auth_setup"
 		case strings.Contains(check.Reason, "model not present in local cache"):
 			action.Action = "model_cache"
-			action.ApplyOK = true
 			action.Source = modelSourceForBackend(check.Backend, check.Model)
 			action.Command = modelDownloadCommand(check.Backend, check.Model)
+			action.ApplyOK = action.Source != "" && len(action.Command) > 0
+			if !action.ApplyOK {
+				action.Reason = "model source is not declared; use hf://owner/repository"
+			}
 		case strings.Contains(check.Reason, "no model configured"):
 			action.Action = "configure_model"
 		default:
@@ -350,34 +455,50 @@ func buildProvisionPlan(checks []StartupCheck) []ProvisionAction {
 func backendSetupCommand(backend BackendType) []string {
 	switch backend {
 	case BackendMLX:
-		return []string{"python3", "-m", "pip", "install", "mlx"}
+		return []string{"python3", "-m", "pip", "install", "mlx-lm"}
 	case BackendLLAMACPP:
-		return []string{"brew", "install", "llama.cpp"}
+		switch runtime.GOOS {
+		case "darwin", "linux":
+			return []string{"brew", "install", "llama.cpp"}
+		case "windows":
+			return []string{"winget", "install", "llama.cpp"}
+		}
 	default:
 		return nil
 	}
+	return nil
 }
 
 func modelSourceForBackend(backend BackendType, model string) string {
-	switch backend {
-	case BackendMLX:
-		return "huggingface://mlx-community/" + sanitizeModelSlug(model)
-	case BackendLLAMACPP:
-		return "huggingface://ggml-org/" + sanitizeModelSlug(model)
-	default:
-		return "huggingface://" + sanitizeModelSlug(model)
+	_ = backend
+	model = strings.TrimSpace(model)
+	if strings.HasPrefix(model, "hf://") || strings.HasPrefix(model, "huggingface://") {
+		return model
 	}
+	if strings.HasPrefix(model, "hf/") {
+		return "huggingface://" + strings.TrimPrefix(model, "hf/")
+	}
+	return ""
 }
 
 func modelDownloadCommand(backend BackendType, model string) []string {
+	source := modelSourceForBackend(backend, model)
+	if source == "" {
+		return nil
+	}
+	repo := strings.TrimPrefix(source, "huggingface://")
+	repo = strings.TrimPrefix(repo, "hf://")
 	slug := sanitizeModelSlug(model)
+	if repo == "" || slug == "" {
+		return nil
+	}
 	switch backend {
 	case BackendMLX:
-		return []string{"hf", "download", "mlx-community/" + slug, "--local-dir", modelCachePath(backend, model)}
+		return []string{"hf", "download", repo, "--local-dir", modelCachePath(backend, model)}
 	case BackendLLAMACPP:
-		return []string{"hf", "download", "ggml-org/" + slug, "--local-dir", modelCachePath(backend, model)}
+		return []string{"hf", "download", repo, "--local-dir", modelCachePath(backend, slug)}
 	default:
-		return []string{"hf", "download", slug, "--local-dir", modelCachePath(backend, model)}
+		return nil
 	}
 }
 
@@ -388,16 +509,22 @@ func modelCachePath(backend BackendType, model string) string {
 	}
 	switch backend {
 	case BackendMLX:
-		return base.CacheDir() + "/mlx/" + sanitizeModelSlug(model)
+		if relative := localModelRelativePath(model); relative != "" {
+			return filepath.Join(base.CacheDir(), relative)
+		}
+		return filepath.Join(base.CacheDir(), "mlx", sanitizeModelSlug(model))
 	case BackendLLAMACPP:
-		return base.CacheDir() + "/" + sanitizeModelSlug(model) + ".gguf"
+		return filepath.Join(base.CacheDir(), "llama.cpp", sanitizeModelSlug(model))
 	default:
-		return base.CacheDir() + "/" + sanitizeModelSlug(model)
+		return filepath.Join(base.CacheDir(), sanitizeModelSlug(model))
 	}
 }
 
 func sanitizeModelSlug(model string) string {
 	slug := strings.TrimSpace(model)
+	slug = strings.TrimPrefix(slug, "hf://")
+	slug = strings.TrimPrefix(slug, "huggingface://")
+	slug = strings.TrimPrefix(slug, "hf/")
 	slug = strings.TrimPrefix(slug, "cc/")
 	slug = strings.TrimPrefix(slug, "cx/")
 	slug = strings.TrimPrefix(slug, "oc/")

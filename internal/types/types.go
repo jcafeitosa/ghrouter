@@ -19,6 +19,7 @@ type Config struct {
 	Storage      StorageConfig      `yaml:"storage"`
 	RateLimit    RateLimitConfig    `yaml:"rate_limit,omitempty" json:"rate_limit,omitempty"`
 	Cooldown     CooldownConfig     `yaml:"cooldown,omitempty" json:"cooldown,omitempty"`
+	Circuit      CircuitConfig      `yaml:"circuit,omitempty" json:"circuit,omitempty"`
 	Health       HealthConfig       `yaml:"health,omitempty" json:"health,omitempty"`
 	Logging      LoggingConfig      `yaml:"logging,omitempty" json:"logging,omitempty"`
 	Server       ServerConfig       `yaml:"server,omitempty" json:"server,omitempty"`
@@ -79,6 +80,16 @@ func (c CooldownConfig) IsEnabled() bool {
 	return c.Enabled == nil || *c.Enabled
 }
 
+type CircuitConfig struct {
+	Enabled          *bool         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	FailureThreshold int           `yaml:"failure_threshold,omitempty" json:"failure_threshold,omitempty"`
+	OpenDuration     time.Duration `yaml:"open_duration,omitempty" json:"open_duration,omitempty"`
+}
+
+func (c CircuitConfig) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
 type HealthConfig struct {
 	Enabled    *bool         `yaml:"enabled,omitempty" json:"enabled,omitempty"`
 	Interval   time.Duration `yaml:"interval,omitempty" json:"interval,omitempty"`
@@ -116,17 +127,19 @@ type VerificationConfig struct {
 }
 
 type LocalBrainConfig struct {
-	Enabled        bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
-	AutoProvision  bool          `yaml:"auto_provision,omitempty" json:"auto_provision,omitempty"`
-	Backend        string        `yaml:"backend,omitempty" json:"backend,omitempty"`
-	Model          string        `yaml:"model,omitempty" json:"model,omitempty"`
-	Source         string        `yaml:"source,omitempty" json:"source,omitempty"`
-	Host           string        `yaml:"host,omitempty" json:"host,omitempty"`
-	Port           int           `yaml:"port,omitempty" json:"port,omitempty"`
-	StartupTimeout time.Duration `yaml:"startup_timeout,omitempty" json:"startup_timeout,omitempty"`
-	Restart        bool          `yaml:"restart,omitempty" json:"restart,omitempty"`
-	RestartBackoff time.Duration `yaml:"restart_backoff,omitempty" json:"restart_backoff,omitempty"`
-	MaxRestarts    int           `yaml:"max_restarts,omitempty" json:"max_restarts,omitempty"`
+	Enabled           bool          `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+	ManagedExternally bool          `yaml:"managed_externally,omitempty" json:"managed_externally,omitempty"`
+	AutoProvision     bool          `yaml:"auto_provision,omitempty" json:"auto_provision,omitempty"`
+	AllowModelSwitch  bool          `yaml:"allow_model_switch,omitempty" json:"allow_model_switch,omitempty"`
+	Backend           string        `yaml:"backend,omitempty" json:"backend,omitempty"`
+	Model             string        `yaml:"model,omitempty" json:"model,omitempty"`
+	Source            string        `yaml:"source,omitempty" json:"source,omitempty"`
+	Host              string        `yaml:"host,omitempty" json:"host,omitempty"`
+	Port              int           `yaml:"port,omitempty" json:"port,omitempty"`
+	StartupTimeout    time.Duration `yaml:"startup_timeout,omitempty" json:"startup_timeout,omitempty"`
+	Restart           bool          `yaml:"restart,omitempty" json:"restart,omitempty"`
+	RestartBackoff    time.Duration `yaml:"restart_backoff,omitempty" json:"restart_backoff,omitempty"`
+	MaxRestarts       int           `yaml:"max_restarts,omitempty" json:"max_restarts,omitempty"`
 }
 
 func (c VerificationConfig) IsEnabled() bool {
@@ -154,9 +167,18 @@ type Provider struct {
 	FailureReason    string               `yaml:"failure_reason,omitempty" json:"failure_reason,omitempty"`
 	AuthMethod       AuthMethod           `yaml:"auth_method"`
 	AuthConfig       map[string]string    `yaml:"auth_config"`
+	Accounts         []ProviderCredential `yaml:"accounts,omitempty" json:"accounts,omitempty"`
 	Account          ProviderAccount      `yaml:"account"`
 	Enabled          bool                 `yaml:"enabled"`
 	Discovery        DiscoveryState       `yaml:"discovery,omitempty" json:"discovery,omitempty"`
+	Harness          HarnessCapabilities  `yaml:"harness,omitempty" json:"harness,omitempty"`
+}
+
+type ProviderCredential struct {
+	Name      string `yaml:"name" json:"name"`
+	APIKey    string `yaml:"api_key,omitempty" json:"-"`
+	APIKeyEnv string `yaml:"api_key_env,omitempty" json:"api_key_env,omitempty"`
+	Enabled   bool   `yaml:"enabled" json:"enabled"`
 }
 
 // ProviderType identifies the provider kind
@@ -174,6 +196,7 @@ const (
 	ProviderAnthropic  ProviderType = "anthropic"
 	ProviderAzure      ProviderType = "azure"
 	ProviderOllama     ProviderType = "ollama"
+	ProviderNVIDIA     ProviderType = "nvidia"
 	ProviderCustom     ProviderType = "custom"
 )
 
@@ -233,17 +256,21 @@ func (a ProviderAccount) String() string {
 
 // OpenAIRequest is the incoming request from gh copilot (OpenAI Chat Completions format)
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	SessionID   string          `json:"-"`
-	RequestID   string          `json:"-"`
-	Messages    []OpenAIMessage `json:"messages"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	TopP        *float64        `json:"top_p,omitempty"`
-	MaxTokens   *int            `json:"max_tokens,omitempty"`
-	Stream      *bool           `json:"stream,omitempty"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
-	ToolChoice  any             `json:"tool_choice,omitempty"`
-	Stop        any             `json:"stop,omitempty"`
+	Model              string          `json:"model"`
+	SessionID          string          `json:"-"`
+	RequestID          string          `json:"-"`
+	SelectionStage     string          `json:"-"`
+	SelectionReason    string          `json:"-"`
+	Messages           []OpenAIMessage `json:"messages"`
+	Temperature        *float64        `json:"temperature,omitempty"`
+	TopP               *float64        `json:"top_p,omitempty"`
+	MaxTokens          *int            `json:"max_tokens,omitempty"`
+	Stream             *bool           `json:"stream,omitempty"`
+	ReasoningEffort    string          `json:"reasoning_effort,omitempty"`
+	Tools              []OpenAITool    `json:"tools,omitempty"`
+	ToolChoice         any             `json:"tool_choice,omitempty"`
+	ChatTemplateKwargs map[string]any  `json:"chat_template_kwargs,omitempty"`
+	Stop               any             `json:"stop,omitempty"`
 }
 
 // OpenAIMessage represents a message in the conversation

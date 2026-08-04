@@ -24,6 +24,9 @@ func TestHandleModelsUsesCanonicalIDsAndSkipsCooldownCanonical(t *testing.T) {
 				Type:    types.ProviderCodex,
 				Enabled: true,
 				Models:  []string{"gpt-5"},
+				ModelInfo: map[string]types.ModelInfo{
+					"cx/gpt-5": {Source: "configured", HealthStatus: "healthy", VerifiedAt: time.Now().UTC()},
+				},
 			},
 		},
 	})

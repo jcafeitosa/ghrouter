@@ -7,12 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ghrouter/internal/types"
@@ -20,13 +22,33 @@ import (
 
 type Detector struct{ discovered map[string]*types.Provider }
 
+const nativeDiscoveryTimeout = 5 * time.Second
+const acpProbeTimeout = 2 * time.Second
+const discoveryCacheTTL = 15 * time.Second
+
+var discoveryCache struct {
+	sync.Mutex
+	key       string
+	expiresAt time.Time
+	providers []*types.Provider
+}
+
 func NewDetector() *Detector { return &Detector{discovered: make(map[string]*types.Provider)} }
+
+func (d *Detector) DetectAll() ([]*types.Provider, error) {
+	return d.detectAll(false)
+}
+
+func (d *Detector) DetectAllFresh() ([]*types.Provider, error) {
+	return d.detectAll(true)
+}
 
 type CLISpec struct {
 	Name             string
 	ProviderType     types.ProviderType
 	Args             []string
 	DiscoveryArgs    []string
+	ACPArgs          []string
 	DiscoveryEnabled bool
 	ACPProbeEnabled  bool
 }
@@ -49,36 +71,261 @@ func ResolveCLIPath(provider types.ProviderType) string {
 	return ""
 }
 
-func (d *Detector) DetectAll() ([]*types.Provider, error) {
+func (d *Detector) detectAll(force bool) ([]*types.Provider, error) {
+	cacheKey := discoveryCacheKey()
+	if !force {
+		discoveryCache.Lock()
+		if discoveryCache.key == cacheKey && time.Now().Before(discoveryCache.expiresAt) {
+			providers := cloneProviders(discoveryCache.providers)
+			discoveryCache.Unlock()
+			d.remember(providers)
+			return providers, nil
+		}
+		discoveryCache.Unlock()
+	}
 	specs := []CLISpec{
-		{Name: "claude", ProviderType: types.ProviderClaudeCode, Args: []string{"--print", "--output-format", "stream-json", "--no-session-persistence"}},
-		{Name: "codex", ProviderType: types.ProviderCodex, Args: []string{"exec", "--json", "--ephemeral", "--skip-git-repo-check"}},
-		{Name: "opencode", ProviderType: types.ProviderOpenCode, Args: []string{"run", "--format", "json", "--no-remote"}, DiscoveryArgs: []string{"models", "--verbose", "--pure"}, DiscoveryEnabled: true, ACPProbeEnabled: true},
+		{Name: "claude", ProviderType: types.ProviderClaudeCode, Args: []string{"--print", "--output-format", "stream-json", "--verbose", "--no-session-persistence"}},
+		{Name: "codex", ProviderType: types.ProviderCodex, Args: []string{"exec", "--json", "--ephemeral", "--skip-git-repo-check"}, DiscoveryEnabled: true},
+		{Name: "opencode", ProviderType: types.ProviderOpenCode, Args: []string{"run", "--format", "json", "--pure"}, DiscoveryArgs: []string{"models", "--verbose", "--pure"}, DiscoveryEnabled: true, ACPProbeEnabled: true},
 		{Name: "mimo", ProviderType: types.ProviderMimo, Args: []string{"run", "--format", "json", "--pure"}, DiscoveryArgs: []string{"models"}, DiscoveryEnabled: true, ACPProbeEnabled: true},
 		{Name: "pi", ProviderType: types.ProviderPi, Args: []string{"--mode", "json", "--print", "--no-session", "--no-context-files"}, DiscoveryArgs: []string{"--list-models"}, DiscoveryEnabled: true},
-		{Name: "cursor", ProviderType: types.ProviderCursor, Args: []string{"agent", "-p", "--output-format", "stream-json", "--stream-partial-output"}, DiscoveryArgs: []string{"agent", "--list-models"}, DiscoveryEnabled: true},
+		{Name: "cursor", ProviderType: types.ProviderCursor, Args: []string{"agent", "-p", "--output-format", "stream-json", "--stream-partial-output"}, ACPArgs: []string{"agent", "--trust", "acp"}, DiscoveryEnabled: true, ACPProbeEnabled: true},
 	}
-	providers := make([]*types.Provider, 0, len(specs))
-	for _, spec := range specs {
-		path := ResolveCLIPath(spec.ProviderType)
-		if path == "" {
-			continue
-		}
-		provider := d.buildProvider(spec, path)
-		provider.Protocol, provider.Origin, provider.CapabilityStatus, provider.FailureReason = classifyProviderCapability(path, spec.ProviderType, spec.ACPProbeEnabled)
-		if spec.DiscoveryEnabled {
-			enrichProviderDiscovery(provider, discoverModelsWithTimeout(path, spec.ProviderType, 2*time.Second))
-		} else {
-			provider.Discovery = types.DiscoveryState{
-				Status:       types.DiscoveryUnsupported,
-				Error:        "native model discovery is unavailable for this CLI",
-				DiscoveredAt: time.Now().UTC(),
+	detected := make([]*types.Provider, len(specs))
+	var wg sync.WaitGroup
+	for index := range specs {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			spec := specs[index]
+			path := ResolveCLIPath(spec.ProviderType)
+			if path == "" {
+				return
 			}
+			provider := d.buildProvider(spec, path)
+			provider.Harness = probeHarnessCapabilities(path, spec.ProviderType)
+			provider.Protocol, provider.Origin, provider.CapabilityStatus, provider.FailureReason = classifyProviderCapability(path, spec.ProviderType, spec.ACPProbeEnabled, spec.ACPArgs)
+			provider.Harness.ACPHandshakeConfirmed = provider.Protocol == "acp"
+			if spec.DiscoveryEnabled && !(spec.ProviderType == types.ProviderCursor && provider.Protocol != "acp") {
+				enrichProviderDiscovery(provider, discoverModelsWithTimeout(path, spec.ProviderType, nativeDiscoveryTimeout))
+			} else {
+				reason := "native model discovery is unavailable for this CLI"
+				if spec.ProviderType == types.ProviderCursor && provider.Protocol != "acp" {
+					reason = "Cursor ACP handshake was not confirmed"
+				}
+				provider.Discovery = types.DiscoveryState{
+					Status:       types.DiscoveryUnsupported,
+					Error:        reason,
+					DiscoveredAt: time.Now().UTC(),
+				}
+			}
+			detected[index] = provider
+		}(index)
+	}
+	wg.Wait()
+	providers := make([]*types.Provider, 0, len(specs))
+	for _, provider := range detected {
+		if provider == nil {
+			continue
 		}
 		providers = append(providers, provider)
 		d.discovered[provider.Name] = provider
 	}
-	return providers, nil
+	if nvidia := detectConfiguredNVIDIA(); nvidia != nil {
+		providers = append(providers, nvidia)
+		d.discovered[nvidia.Name] = nvidia
+	}
+	discoveryCache.Lock()
+	discoveryCache.key = cacheKey
+	discoveryCache.expiresAt = time.Now().Add(discoveryCacheTTL)
+	discoveryCache.providers = cloneProviders(providers)
+	discoveryCache.Unlock()
+	return cloneProviders(providers), nil
+}
+
+func (d *Detector) remember(providers []*types.Provider) {
+	for _, provider := range providers {
+		if provider != nil {
+			d.discovered[provider.Name] = provider
+		}
+	}
+}
+
+func discoveryCacheKey() string {
+	parts := []string{os.Getenv("PATH"), currentWorkDir(), os.Getenv("GHR_NVIDIA_MODELS"), os.Getenv("GHR_NVIDIA_DISCOVER_ALL")}
+	for _, providerType := range []types.ProviderType{
+		types.ProviderClaudeCode,
+		types.ProviderCodex,
+		types.ProviderOpenCode,
+		types.ProviderMimo,
+		types.ProviderPi,
+		types.ProviderCursor,
+	} {
+		parts = append(parts, string(providerType)+"="+ResolveCLIPath(providerType))
+		for _, key := range specsAuthAllowlist(providerType) {
+			if os.Getenv(key) != "" {
+				parts = append(parts, key+"=set")
+			} else {
+				parts = append(parts, key+"=unset")
+			}
+		}
+	}
+	return strings.Join(parts, "\x00")
+}
+
+func cloneProviders(providers []*types.Provider) []*types.Provider {
+	cloned := make([]*types.Provider, 0, len(providers))
+	for _, provider := range providers {
+		if provider == nil {
+			continue
+		}
+		copy := *provider
+		copy.Args = append([]string(nil), provider.Args...)
+		copy.Models = append([]string(nil), provider.Models...)
+		copy.Env = cloneStringMap(provider.Env)
+		copy.AuthConfig = cloneStringMap(provider.AuthConfig)
+		copy.ModelInfo = make(map[string]types.ModelInfo, len(provider.ModelInfo))
+		for model, info := range provider.ModelInfo {
+			info.Effort = append([]string(nil), info.Effort...)
+			info.Modalities = append([]string(nil), info.Modalities...)
+			copy.ModelInfo[model] = info
+		}
+		copy.Accounts = append([]types.ProviderCredential(nil), provider.Accounts...)
+		copy.Harness.Commands = append([]string(nil), provider.Harness.Commands...)
+		copy.Harness.Flags = append([]string(nil), provider.Harness.Flags...)
+		copy.Harness.Formats = append([]string(nil), provider.Harness.Formats...)
+		copy.Harness.SlashCommands = append([]string(nil), provider.Harness.SlashCommands...)
+		cloned = append(cloned, &copy)
+	}
+	return cloned
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	copy := make(map[string]string, len(values))
+	for key, value := range values {
+		copy[key] = value
+	}
+	return copy
+}
+
+func detectConfiguredNVIDIA() *types.Provider {
+	if strings.TrimSpace(os.Getenv("NVIDIA_API_KEY")) == "" {
+		return nil
+	}
+	models := make([]string, 0)
+	info := make(map[string]types.ModelInfo)
+	addModel := func(raw, source string) {
+		model := canonicalModelReference(&types.Provider{Type: types.ProviderNVIDIA}, raw)
+		if model == "" || !modelIDPattern.MatchString(model) {
+			return
+		}
+		for _, existing := range models {
+			if existing == model {
+				return
+			}
+		}
+		models = append(models, model)
+		modelInfo := types.ModelInfo{Source: source}
+		if source == "nvidia_api" {
+			modelInfo = classifyNVIDIAModel(model)
+		}
+		info[model] = modelInfo
+	}
+	for _, raw := range strings.Split(strings.TrimSpace(os.Getenv("GHR_NVIDIA_MODELS")), ",") {
+		addModel(raw, "env")
+	}
+	if os.Getenv("GHR_NVIDIA_DISCOVER_ALL") == "1" {
+		for _, model := range discoverNVIDIAModels() {
+			addModel(model, "nvidia_api")
+		}
+	}
+	if len(models) == 0 {
+		return nil
+	}
+	return &types.Provider{
+		Name:       "nvidia",
+		Type:       types.ProviderNVIDIA,
+		BaseURL:    "https://integrate.api.nvidia.com",
+		AuthMethod: types.AuthEnv,
+		Models:     models,
+		ModelInfo:  info,
+		Enabled:    true,
+		Discovery:  types.DiscoveryState{Status: types.DiscoverySuccess, DiscoveredAt: time.Now().UTC()},
+	}
+}
+
+func discoverNVIDIAModels() []string {
+	request, err := http.NewRequest(http.MethodGet, "https://integrate.api.nvidia.com/v1/models", nil)
+	if err != nil {
+		return nil
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.TrimSpace(os.Getenv("NVIDIA_API_KEY")))
+	response, err := (&http.Client{Timeout: 3 * time.Second}).Do(request)
+	if err != nil {
+		return nil
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil
+	}
+	var payload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2*1024*1024)).Decode(&payload); err != nil {
+		return nil
+	}
+	models := make([]string, 0, len(payload.Data))
+	for _, item := range payload.Data {
+		if strings.TrimSpace(item.ID) != "" {
+			models = append(models, item.ID)
+		}
+	}
+	return models
+}
+
+func classifyNVIDIAModel(model string) types.ModelInfo {
+	lower := strings.ToLower(model)
+	info := types.ModelInfo{Source: "nvidia_api", Model: model}
+	addModality := func(value string) {
+		for _, existing := range info.Modalities {
+			if existing == value {
+				return
+			}
+		}
+		info.Modalities = append(info.Modalities, value)
+	}
+	switch {
+	case strings.Contains(lower, "embed"), strings.Contains(lower, "rerank"), strings.Contains(lower, "retriev"):
+		info.Kind = "embedding_retrieval"
+		addModality("text")
+	case strings.Contains(lower, "image"), strings.Contains(lower, "flux"), strings.Contains(lower, "diffusion"):
+		info.Kind = "image"
+		addModality("image")
+	case strings.Contains(lower, "audio"), strings.Contains(lower, "whisper"), strings.Contains(lower, "riva"), strings.Contains(lower, "voice"):
+		info.Kind = "audio"
+		addModality("audio")
+	case strings.Contains(lower, "vision"), strings.Contains(lower, "-vl"), strings.Contains(lower, "paligemma"), strings.Contains(lower, "fuyu"), strings.Contains(lower, "kosmos"), strings.Contains(lower, "neva"):
+		info.Kind = "multimodal"
+		info.Vision = true
+		addModality("text")
+		addModality("image")
+	case strings.Contains(lower, "safety"), strings.Contains(lower, "guard"), strings.Contains(lower, "content-safety"):
+		info.Kind = "safety"
+		addModality("text")
+	case strings.Contains(lower, "code"), strings.Contains(lower, "coder"), strings.Contains(lower, "starcoder"), strings.Contains(lower, "codestral"):
+		info.Kind = "coding"
+		info.ToolUse = true
+		addModality("text")
+	default:
+		info.Kind = "chat"
+		addModality("text")
+	}
+	return info
 }
 
 func (d *Detector) buildProvider(spec CLISpec, path string) *types.Provider {
@@ -150,13 +397,13 @@ func specsAuthAllowlist(providerType types.ProviderType) []string {
 	case types.ProviderClaudeCode:
 		return []string{"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"}
 	case types.ProviderCodex:
-		return []string{"OPENAI_API_KEY", "OPENAI_API_BASE", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_HOME"}
+		return []string{"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE", "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "CODEX_HOME"}
 	case types.ProviderOpenCode:
 		return []string{"OPENAI_API_KEY", "OPENAI_API_BASE", "OPENCODE_API_KEY", "OPENCODE_HOME"}
 	case types.ProviderMimo:
 		return []string{"OPENAI_API_KEY", "MIMO_API_KEY", "MIMO_HOME"}
 	case types.ProviderPi:
-		return []string{"PI_HOME", "OPENAI_API_KEY", "GOOGLE_API_KEY", "PI_API_KEY"}
+		return []string{"PI_HOME", "PI_CODING_AGENT_DIR", "OPENAI_API_KEY", "GOOGLE_API_KEY", "PI_API_KEY"}
 	case types.ProviderCursor:
 		return []string{"CURSOR_API_KEY", "CURSOR_API_ENDPOINT"}
 	default:
@@ -164,8 +411,23 @@ func specsAuthAllowlist(providerType types.ProviderType) []string {
 	}
 }
 
-func classifyProviderCapability(path string, providerType types.ProviderType, acpProbeEnabled bool) (protocol string, origin string, capabilityStatus string, failureReason string) {
+func classifyProviderCapability(path string, providerType types.ProviderType, acpProbeEnabled bool, acpArgs []string) (protocol string, origin string, capabilityStatus string, failureReason string) {
+	if len(acpArgs) == 0 {
+		acpArgs = []string{"acp"}
+	}
+	if providerType == types.ProviderCursor {
+		if acpProbeEnabled && probeACPInitializeWithArgs(path, acpArgs, true) {
+			return "acp", "native_cli", "supported", ""
+		}
+		return "native_cli", "native_cli", "unsupported", "ACP initialize handshake not confirmed"
+	}
 	ok, status, reason := probeHelpForACP(path)
+	if providerType == types.ProviderCodex {
+		if status == "timeout" || status == "auth" || status == "unknown" {
+			return "native_app_server", "native_app_server", status, reason
+		}
+		return "native_app_server", "native_app_server", "supported", ""
+	}
 	if status == "timeout" || status == "auth" || status == "unknown" {
 		switch providerType {
 		case types.ProviderPi:
@@ -177,7 +439,7 @@ func classifyProviderCapability(path string, providerType types.ProviderType, ac
 	switch providerType {
 	case types.ProviderOpenCode, types.ProviderMimo:
 		if ok && acpProbeEnabled {
-			if probeACPInitialize(path) {
+			if probeACPInitializeWithArgs(path, acpArgs, false) {
 				return "acp", "native_cli", "supported", ""
 			}
 		}
@@ -192,12 +454,12 @@ func classifyProviderCapability(path string, providerType types.ProviderType, ac
 	}
 }
 
-func probeACPInitialize(path string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+func probeACPInitializeWithArgs(path string, args []string, cursorCapabilities bool) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), acpProbeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, path, "acp")
+	cmd := exec.CommandContext(ctx, path, args...)
 	prepareDiscoveryCommand(cmd)
-	stdout, stderr, err := runACPInitialize(ctx, cmd)
+	stdout, stderr, err := runACPInitializeWithCapabilities(ctx, cmd, cursorCapabilities)
 	if ctx.Err() != nil || err != nil {
 		return false
 	}
@@ -205,33 +467,106 @@ func probeACPInitialize(path string) bool {
 }
 
 func runACPInitialize(ctx context.Context, cmd *exec.Cmd) ([]byte, []byte, error) {
-	stdin, err := cmd.StdinPipe()
+	return runACPInitializeWithCapabilities(ctx, cmd, false)
+}
+
+func runACPInitializeWithCapabilities(ctx context.Context, cmd *exec.Cmd, cursorCapabilities bool) ([]byte, []byte, error) {
+	stdoutFile, err := os.CreateTemp("", "ghrouter-acp-stdout-")
 	if err != nil {
 		return nil, nil, err
 	}
-	stdout, err := cmd.StdoutPipe()
+	stdoutPath := stdoutFile.Name()
+	defer os.Remove(stdoutPath)
+	defer stdoutFile.Close()
+	stderrFile, err := os.CreateTemp("", "ghrouter-acp-stderr-")
 	if err != nil {
-		_ = stdin.Close()
 		return nil, nil, err
 	}
-	stderr, err := cmd.StderrPipe()
+	stderrPath := stderrFile.Name()
+	defer os.Remove(stderrPath)
+	defer stderrFile.Close()
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stderrFile
+	cmd.WaitDelay = 500 * time.Millisecond
+	clientCapabilities := map[string]any{}
+	if cursorCapabilities {
+		clientCapabilities = map[string]any{
+			"fs":       map[string]bool{"readTextFile": true, "writeTextFile": true},
+			"terminal": true,
+		}
+	}
+	initialize := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params": map[string]any{
+			"protocolVersion":    1,
+			"clientCapabilities": clientCapabilities,
+			"clientInfo":         map[string]string{"name": "ghrouter", "version": "dev"},
+		},
+	}
+	payload, err := json.Marshal(initialize)
 	if err != nil {
-		_ = stdin.Close()
 		return nil, nil, err
+	}
+	var stdinWriter *io.PipeWriter
+	if cursorCapabilities {
+		stdinReader, writer := io.Pipe()
+		cmd.Stdin = stdinReader
+		stdinWriter = writer
+	} else {
+		cmd.Stdin = strings.NewReader(string(payload) + "\n")
 	}
 	if err := cmd.Start(); err != nil {
-		_ = stdin.Close()
+		if stdinWriter != nil {
+			_ = stdinWriter.Close()
+		}
 		return nil, nil, err
 	}
-	payload := []byte(`{"method":"initialize","protocolVersion":1,"capabilities":{"catalog":true},"authMethods":["env"]}` + "\n")
-	go func() {
-		defer stdin.Close()
-		_, _ = stdin.Write(payload)
-	}()
-	stdoutBytes, _ := io.ReadAll(stdout)
-	stderrBytes, _ := io.ReadAll(stderr)
-	if err := cmd.Wait(); err != nil {
-		return stdoutBytes, stderrBytes, err
+	if stdinWriter != nil {
+		go func() {
+			message := append(append([]byte(nil), payload...), '\n')
+			if cursorCapabilities {
+				message = append(message, []byte("{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}\n")...)
+			}
+			if _, err := stdinWriter.Write(message); err != nil {
+				_ = stdinWriter.Close()
+				return
+			}
+			timer := time.NewTimer(500 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+			_ = stdinWriter.Close()
+		}()
+	}
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	var runErr error
+	select {
+	case runErr = <-waitCh:
+	case <-ctx.Done():
+		if stdinWriter != nil {
+			_ = stdinWriter.CloseWithError(ctx.Err())
+		}
+		killDiscoveryProcess(cmd)
+		runErr, _ = waitDiscoveryProcess(waitCh)
+		if runErr == nil {
+			runErr = ctx.Err()
+		}
+	}
+	stdoutBytes, stdoutErr := os.ReadFile(stdoutPath)
+	if stdoutErr != nil {
+		return nil, nil, stdoutErr
+	}
+	stderrBytes, stderrErr := os.ReadFile(stderrPath)
+	if stderrErr != nil {
+		return stdoutBytes, nil, stderrErr
+	}
+	if runErr != nil {
+		return stdoutBytes, stderrBytes, runErr
 	}
 	return stdoutBytes, stderrBytes, nil
 }
@@ -240,20 +575,21 @@ func hasACPInitializeSuccess(stdout, stderr []byte) bool {
 	if len(stdout) == 0 && len(stderr) == 0 {
 		return false
 	}
-	joined := append(append([]byte(nil), stdout...), stderr...)
-	if bytes.Contains(bytes.ToLower(joined), []byte("\"error\"")) || bytes.Contains(bytes.ToLower(joined), []byte("method not found")) || bytes.Contains(bytes.ToLower(joined), []byte("invalid params")) {
-		return false
-	}
 	type initializeResponse struct {
-		ProtocolVersion any            `json:"protocolVersion"`
-		Result          map[string]any `json:"result"`
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  *struct {
+			ProtocolVersion int `json:"protocolVersion"`
+		} `json:"result"`
+		Error json.RawMessage `json:"error"`
 	}
-	var resp initializeResponse
-	if err := json.NewDecoder(bytes.NewReader(stdout)).Decode(&resp); err == nil {
-		if resp.ProtocolVersion != nil {
-			return true
+	scanner := bufio.NewScanner(bytes.NewReader(stdout))
+	for scanner.Scan() {
+		var resp initializeResponse
+		if err := json.Unmarshal(scanner.Bytes(), &resp); err != nil {
+			continue
 		}
-		if len(resp.Result) > 0 {
+		if resp.JSONRPC == "2.0" && len(resp.ID) > 0 && len(resp.Error) == 0 && resp.Result != nil && resp.Result.ProtocolVersion > 0 {
 			return true
 		}
 	}
@@ -368,8 +704,8 @@ func BuildAutomaticModelLists(providers []*types.Provider, existing []types.Mode
 			if model == "" {
 				continue
 			}
-			info := provider.ModelInfo[model]
-			if !eligibleForAutomaticList(info, model) {
+			info, hasInfo := provider.ModelInfo[model]
+			if !eligibleForAutomaticList(provider.Type, info, model, hasInfo) {
 				continue
 			}
 			members = append(members, model)
@@ -389,28 +725,51 @@ func BuildAutomaticModelLists(providers []*types.Provider, existing []types.Mode
 		}
 		members = compactModelReferences(members)
 		if len(members) > 0 {
+			sort.Strings(members)
 			providerLists["ghrouter/"+provider.Name] = members
 		}
 	}
+	sort.Strings(all)
+	for name, members := range capabilityLists {
+		members = compactModelReferences(members)
+		sort.Strings(members)
+		capabilityLists[name] = members
+	}
+	providerListNames := make(map[string]struct{}, len(providers))
+	for _, provider := range providers {
+		if provider != nil {
+			providerListNames["ghrouter/"+provider.Name] = struct{}{}
+		}
+	}
 	for i := range lists {
-		if members, ok := providerLists[lists[i].Name]; ok {
-			lists[i].Models = append([]string(nil), members...)
+		if _, ok := providerListNames[lists[i].Name]; ok {
+			lists[i].Models = append([]string(nil), providerLists[lists[i].Name]...)
 		}
 		if lists[i].Name == "ghrouter/auto" {
 			lists[i].Models = append([]string(nil), all...)
+		}
+		if members, ok := capabilityLists[lists[i].Name]; ok {
+			lists[i].Models = append([]string(nil), compactModelReferences(members)...)
 		}
 	}
 	seen := make(map[string]bool, len(lists))
 	for _, list := range lists {
 		seen[list.Name] = true
 	}
-	for name, members := range providerLists {
+	providerNames := make([]string, 0, len(providerLists))
+	for name := range providerLists {
+		providerNames = append(providerNames, name)
+	}
+	sort.Strings(providerNames)
+	for _, name := range providerNames {
+		members := providerLists[name]
 		if !seen[name] && len(members) > 0 {
 			lists = append(lists, types.ModelList{Name: name, Kind: "provider", Strategy: "round-robin", Models: members})
 		}
 	}
-	for name, members := range capabilityLists {
-		members = compactModelReferences(members)
+	capabilityNames := []string{"ghrouter/context-1m", "ghrouter/reasoning", "ghrouter/vision", "ghrouter/tool-use"}
+	for _, name := range capabilityNames {
+		members := capabilityLists[name]
 		if len(members) == 0 {
 			continue
 		}
@@ -425,18 +784,22 @@ func BuildAutomaticModelLists(providers []*types.Provider, existing []types.Mode
 	return lists
 }
 
-func eligibleForAutomaticList(info types.ModelInfo, model string) bool {
+func eligibleForAutomaticList(providerType types.ProviderType, info types.ModelInfo, model string, hasInfo bool) bool {
 	model = strings.TrimSpace(model)
 	if model == "" {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(info.HealthStatus)) {
-	case "failed", "unhealthy":
+	if !hasInfo && strings.TrimSpace(info.Source) == "" {
+		return providerType == types.ProviderCustom || providerType == types.ProviderLocal
+	}
+	if info.VerifiedAt.IsZero() || info.VerificationError != "" {
 		return false
-	case "cooldown":
-		if info.CooldownUntil.IsZero() || time.Now().Before(info.CooldownUntil) {
-			return false
-		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(info.HealthStatus), "healthy") {
+		return false
+	}
+	if !info.CooldownUntil.IsZero() {
+		return false
 	}
 	return true
 }
@@ -492,6 +855,8 @@ func canonicalPrefixFor(providerType types.ProviderType) string {
 		return "pi"
 	case types.ProviderCursor:
 		return "cu"
+	case types.ProviderNVIDIA:
+		return "nv"
 	default:
 		return ""
 	}
@@ -499,6 +864,9 @@ func canonicalPrefixFor(providerType types.ProviderType) string {
 
 func canonicalizeModelPath(model string) string {
 	model = strings.TrimSpace(model)
+	if strings.HasPrefix(model, "/") {
+		return strings.TrimSuffix(model, "/")
+	}
 	model = strings.TrimPrefix(model, "/")
 	model = strings.TrimSuffix(model, "/")
 	if model == "" {
@@ -526,6 +894,12 @@ func trimDuplicatePrefix(model, prefix string) string {
 var modelIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/+@~-]*$`)
 
 func discoverModelsWithTimeout(path string, provider types.ProviderType, timeout time.Duration) discoveryResult {
+	if provider == types.ProviderCodex {
+		return discoverCodexModelsWithTimeout(path, timeout)
+	}
+	if provider == types.ProviderCursor {
+		return discoverCursorModelsWithTimeout(path, timeout)
+	}
 	args, supported := discoveryArgsForProvider(provider)
 	if !supported {
 		return discoveryResult{status: string(types.DiscoveryUnsupported), err: "native model discovery is unavailable for this CLI"}
@@ -570,11 +944,445 @@ func discoveryArgsForProvider(provider types.ProviderType) ([]string, bool) {
 		return []string{"models"}, true
 	case types.ProviderPi:
 		return []string{"--list-models"}, true
-	case types.ProviderCursor:
-		return []string{"agent", "--list-models"}, true
 	default:
 		return nil, false
 	}
+}
+
+type cursorACPDiscoveryMessage struct {
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Result json.RawMessage `json:"result"`
+	Error  *codexRPCError  `json:"error"`
+}
+
+type cursorACPInitializeResult struct {
+	ProtocolVersion int `json:"protocolVersion"`
+	AuthMethods     []struct {
+		ID string `json:"id"`
+	} `json:"authMethods"`
+}
+
+type cursorACPSessionResult struct {
+	SessionID string `json:"sessionId"`
+	Models    struct {
+		AvailableModels []cursorACPModel `json:"availableModels"`
+	} `json:"models"`
+}
+
+type cursorACPModel struct {
+	ModelID string `json:"modelId"`
+	Name    string `json:"name"`
+}
+
+func discoverCursorModelsWithTimeout(path string, timeout time.Duration) discoveryResult {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, path, "agent", "--trust", "acp")
+	prepareDiscoveryCommand(cmd)
+	cmd.Env = discoveryEnvForProvider(types.ProviderCursor)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP stdin unavailable"}
+	}
+	stdoutFile, err := os.CreateTemp("", "ghrouter-cursor-stdout-")
+	if err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP stdout unavailable"}
+	}
+	stdoutPath := stdoutFile.Name()
+	defer os.Remove(stdoutPath)
+	defer stdoutFile.Close()
+	stderrFile, err := os.CreateTemp("", "ghrouter-cursor-stderr-")
+	if err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP stderr unavailable"}
+	}
+	stderrPath := stderrFile.Name()
+	defer os.Remove(stderrPath)
+	defer stderrFile.Close()
+	cmd.Stdout = stdoutFile
+	cmd.Stderr = stderrFile
+	cmd.WaitDelay = 500 * time.Millisecond
+	if err := cmd.Start(); err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP failed to start"}
+	}
+	waitCh := make(chan error, 1)
+	processDone := make(chan struct{})
+	go func() {
+		waitCh <- cmd.Wait()
+		close(processDone)
+	}()
+	defer func() {
+		_ = stdin.Close()
+		killDiscoveryProcess(cmd)
+		select {
+		case <-waitCh:
+		case <-time.After(time.Second):
+		}
+	}()
+	go func() {
+		select {
+		case <-ctx.Done():
+			killDiscoveryProcess(cmd)
+		case <-processDone:
+		}
+	}()
+	request := func(id int, method string, params any) (cursorACPDiscoveryMessage, error) {
+		if err := writeCodexRPC(stdin, map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
+			return cursorACPDiscoveryMessage{}, err
+		}
+		deadline := time.NewTimer(timeout)
+		defer deadline.Stop()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		readMessage := func() (cursorACPDiscoveryMessage, bool) {
+			data, readErr := os.ReadFile(stdoutPath)
+			if readErr != nil {
+				return cursorACPDiscoveryMessage{}, false
+			}
+			for _, line := range bytes.Split(data, []byte("\n")) {
+				var message cursorACPDiscoveryMessage
+				if err := json.Unmarshal(line, &message); err != nil || message.Method != "" || !cursorACPDiscoveryIDMatches(message.ID, id) {
+					continue
+				}
+				return message, true
+			}
+			return cursorACPDiscoveryMessage{}, false
+		}
+		for {
+			select {
+			case <-ctx.Done():
+				return cursorACPDiscoveryMessage{}, ctx.Err()
+			case <-deadline.C:
+				return cursorACPDiscoveryMessage{}, context.DeadlineExceeded
+			case <-processDone:
+				message, ok := readMessage()
+				if !ok {
+					return cursorACPDiscoveryMessage{}, io.EOF
+				}
+				if message.Error != nil {
+					return cursorACPDiscoveryMessage{}, fmt.Errorf("%s", message.Error.Message)
+				}
+				return message, nil
+			case <-ticker.C:
+				if message, ok := readMessage(); ok {
+					if message.Error != nil {
+						return cursorACPDiscoveryMessage{}, fmt.Errorf("%s", message.Error.Message)
+					}
+					return message, nil
+				}
+			}
+		}
+	}
+
+	initialize, err := request(1, "initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientCapabilities": map[string]any{
+			"fs":       map[string]bool{"readTextFile": true, "writeTextFile": true},
+			"terminal": true,
+		},
+		"clientInfo": map[string]string{"name": "ghrouter", "version": "dev"},
+	})
+	if err != nil {
+		return cursorDiscoveryFailure(ctx, err)
+	}
+	var initializeResult cursorACPInitializeResult
+	if err := json.Unmarshal(initialize.Result, &initializeResult); err != nil || initializeResult.ProtocolVersion == 0 {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP initialize returned an invalid response"}
+	}
+	if err := writeCodexRPC(stdin, map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP initialization acknowledgement failed"}
+	}
+	requestID := 2
+	if len(initializeResult.AuthMethods) > 0 {
+		if _, err := request(requestID, "authenticate", map[string]string{"methodId": initializeResult.AuthMethods[0].ID}); err != nil {
+			return cursorDiscoveryFailure(ctx, err)
+		}
+		requestID++
+	}
+	newSession, err := request(requestID, "session/new", map[string]any{"cwd": currentWorkDir(), "mcpServers": []any{}})
+	if err != nil {
+		return cursorDiscoveryFailure(ctx, err)
+	}
+	var session cursorACPSessionResult
+	if err := json.Unmarshal(newSession.Result, &session); err != nil || session.SessionID == "" {
+		return discoveryResult{status: string(types.DiscoveryError), err: "Cursor ACP session/new returned an invalid response"}
+	}
+	models := make([]string, 0, len(session.Models.AvailableModels))
+	info := make(map[string]types.ModelInfo, len(session.Models.AvailableModels))
+	seen := make(map[string]struct{}, len(session.Models.AvailableModels))
+	for _, model := range session.Models.AvailableModels {
+		publicID := cursorACPModelPublicID(model.ModelID)
+		if publicID == "" {
+			publicID = model.Name
+		}
+		id := canonicalModelID(types.ProviderCursor, publicID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		models = append(models, id)
+		info[id] = types.ModelInfo{Provider: string(types.ProviderCursor), Model: id, Source: "native"}
+	}
+	if len(models) == 0 {
+		return discoveryResult{status: string(types.DiscoveryEmpty), info: info}
+	}
+	sort.Strings(models)
+	return discoveryResult{models: models, info: info, status: string(types.DiscoverySuccess)}
+}
+
+func cursorACPModelPublicID(modelID string) string {
+	modelID = strings.TrimSpace(modelID)
+	if index := strings.IndexByte(modelID, '['); index >= 0 {
+		modelID = modelID[:index]
+	}
+	if strings.EqualFold(modelID, "default") {
+		return "auto"
+	}
+	return modelID
+}
+
+func cursorACPDiscoveryIDMatches(raw json.RawMessage, want int) bool {
+	var got int
+	return json.Unmarshal(raw, &got) == nil && got == want
+}
+
+func cursorDiscoveryFailure(ctx context.Context, err error) discoveryResult {
+	if ctx.Err() != nil {
+		return discoveryResult{status: string(types.DiscoveryTimeout), err: "Cursor ACP model discovery timed out"}
+	}
+	if classifyCodexDiscoveryError(err.Error()) == "auth" {
+		return discoveryResult{status: string(types.DiscoveryAuth), err: "Cursor ACP model discovery failed authentication"}
+	}
+	return discoveryResult{status: string(types.DiscoveryError), err: fmt.Sprintf("Cursor ACP model discovery failed: %v", err)}
+}
+
+func currentWorkDir() string {
+	workDir, err := os.Getwd()
+	if err != nil || workDir == "" {
+		return "."
+	}
+	return workDir
+}
+
+type codexRPCResponse struct {
+	ID     json.RawMessage     `json:"id"`
+	Result *codexModelListPage `json:"result,omitempty"`
+	Error  *codexRPCError      `json:"error,omitempty"`
+}
+
+type codexRPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type codexModelListPage struct {
+	Data       []codexModel `json:"data"`
+	NextCursor *string      `json:"nextCursor"`
+}
+
+type codexModel struct {
+	ID                        string                 `json:"id"`
+	Model                     string                 `json:"model"`
+	Hidden                    bool                   `json:"hidden"`
+	InputModalities           []string               `json:"inputModalities"`
+	SupportedReasoningEfforts []codexReasoningEffort `json:"supportedReasoningEfforts"`
+}
+
+type codexReasoningEffort struct {
+	ReasoningEffort string `json:"reasoningEffort"`
+}
+
+func discoverCodexModelsWithTimeout(path string, timeout time.Duration) discoveryResult {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.Command(path, "app-server", "--stdio")
+	prepareDiscoveryCommand(cmd)
+	cmd.Env = discoveryEnvForProvider(types.ProviderCodex)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "codex app-server stdin unavailable"}
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "codex app-server stdout unavailable"}
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "codex app-server stderr unavailable"}
+	}
+	cmd.WaitDelay = 500 * time.Millisecond
+	if err := cmd.Start(); err != nil {
+		return discoveryResult{status: string(types.DiscoveryError), err: "codex app-server failed to start"}
+	}
+	waitCh := make(chan error, 1)
+	waitStarted := false
+	finishProcess := func() (error, bool) {
+		killDiscoveryProcess(cmd)
+		_ = stdout.Close()
+		_ = stderr.Close()
+		if !waitStarted {
+			waitStarted = true
+			go func() { waitCh <- cmd.Wait() }()
+		}
+		return waitDiscoveryProcess(waitCh)
+	}
+	stderrDone := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(stderr)
+		stderrDone <- data
+	}()
+	processDone := make(chan struct{})
+	defer close(processDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			killDiscoveryProcess(cmd)
+			_ = stdout.Close()
+			_ = stderr.Close()
+		case <-processDone:
+		}
+	}()
+
+	if err := writeCodexRPC(stdin, map[string]any{
+		"id":     1,
+		"method": "initialize",
+		"params": map[string]any{"clientInfo": map[string]string{"name": "ghrouter", "version": "dev"}},
+	}); err != nil {
+		_, _ = finishProcess()
+		return discoveryResult{status: string(types.DiscoveryError), err: "codex app-server initialize failed"}
+	}
+	if err := writeCodexRPC(stdin, map[string]any{"method": "initialized", "params": map[string]any{}}); err != nil {
+		_, _ = finishProcess()
+		return discoveryResult{status: string(types.DiscoveryError), err: "codex app-server initialization acknowledgement failed"}
+	}
+
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	models := make([]string, 0)
+	info := make(map[string]types.ModelInfo)
+	seenPages := make(map[string]struct{})
+	cursor := ""
+	requestID := 2
+	for {
+		params := map[string]any{"cursor": nil, "limit": 500, "includeHidden": false}
+		if cursor != "" {
+			params["cursor"] = cursor
+		}
+		if err := writeCodexRPC(stdin, map[string]any{"id": requestID, "method": "model/list", "params": params}); err != nil {
+			_, _ = finishProcess()
+			return discoveryResult{status: string(types.DiscoveryError), err: "codex model/list request failed"}
+		}
+		var page *codexModelListPage
+		for scanner.Scan() {
+			var response codexRPCResponse
+			if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
+				continue
+			}
+			if !codexRPCIDMatches(response.ID, requestID) {
+				continue
+			}
+			if response.Error != nil {
+				_, _ = finishProcess()
+				if classifyCodexDiscoveryError(response.Error.Message) == "auth" {
+					return discoveryResult{status: string(types.DiscoveryAuth), err: "codex model discovery failed authentication"}
+				}
+				return discoveryResult{status: string(types.DiscoveryError), err: "codex model discovery request failed"}
+			}
+			page = response.Result
+			break
+		}
+		if err := scanner.Err(); err != nil {
+			_, _ = finishProcess()
+			return discoveryResult{status: string(types.DiscoveryError), err: "codex model discovery stream failed"}
+		}
+		if page == nil {
+			_, _ = finishProcess()
+			if ctx.Err() != nil {
+				return discoveryResult{status: string(types.DiscoveryTimeout), err: "codex model discovery timed out"}
+			}
+			return discoveryResult{status: string(types.DiscoveryError), err: "codex model/list returned no response"}
+		}
+		for _, model := range page.Data {
+			if model.Hidden {
+				continue
+			}
+			rawID := model.Model
+			if rawID == "" {
+				rawID = model.ID
+			}
+			id := canonicalModelID(types.ProviderCodex, rawID)
+			if id == "" {
+				continue
+			}
+			if _, ok := seenPages[id]; ok {
+				continue
+			}
+			seenPages[id] = struct{}{}
+			models = append(models, id)
+			modelInfo := types.ModelInfo{Model: id, Source: "native", Provider: string(types.ProviderCodex)}
+			for _, effort := range model.SupportedReasoningEfforts {
+				if effort.ReasoningEffort != "" {
+					modelInfo.Effort = append(modelInfo.Effort, effort.ReasoningEffort)
+				}
+			}
+			modelInfo.Thinking = len(modelInfo.Effort) > 0
+			for _, modality := range model.InputModalities {
+				if strings.EqualFold(modality, "image") {
+					modelInfo.Vision = true
+				}
+			}
+			info[id] = modelInfo
+		}
+		if page.NextCursor == nil || *page.NextCursor == "" {
+			break
+		}
+		if _, seen := seenPages[*page.NextCursor]; seen {
+			break
+		}
+		seenPages[*page.NextCursor] = struct{}{}
+		cursor = *page.NextCursor
+		requestID++
+	}
+	_, _ = finishProcess()
+	stderrBytes := <-stderrDone
+	if ctx.Err() != nil {
+		return discoveryResult{status: string(types.DiscoveryTimeout), err: "codex model discovery timed out"}
+	}
+	if len(models) == 0 {
+		if classifyCodexDiscoveryError(string(stderrBytes)) == "auth" {
+			return discoveryResult{status: string(types.DiscoveryAuth), err: "codex model discovery failed authentication"}
+		}
+		return discoveryResult{status: string(types.DiscoveryEmpty), info: info}
+	}
+	sort.Strings(models)
+	return discoveryResult{models: models, info: info, status: string(types.DiscoverySuccess)}
+}
+
+func writeCodexRPC(w io.Writer, message map[string]any) error {
+	data, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "%s\n", data)
+	return err
+}
+
+func codexRPCIDMatches(raw json.RawMessage, want int) bool {
+	var got int
+	return json.Unmarshal(raw, &got) == nil && got == want
+}
+
+func classifyCodexDiscoveryError(message string) string {
+	lower := strings.ToLower(message)
+	for _, keyword := range []string{"auth", "token", "unauthor", "permission", "login", "credential"} {
+		if strings.Contains(lower, keyword) {
+			return "auth"
+		}
+	}
+	return "unknown"
 }
 
 func classifyDiscoveryFailure(stdout, stderr []byte, err error) string {
@@ -623,6 +1431,21 @@ func discoveryEnvForProvider(providerType types.ProviderType) []string {
 	return env
 }
 
+const discoveryProcessWaitTimeout = time.Second
+
+// waitDiscoveryProcess bounds cleanup when a CLI or one of its descendants
+// does not exit after the process group has been terminated.
+func waitDiscoveryProcess(waitCh <-chan error) (error, bool) {
+	timer := time.NewTimer(discoveryProcessWaitTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-waitCh:
+		return err, true
+	case <-timer.C:
+		return context.DeadlineExceeded, false
+	}
+}
+
 func runBoundedCommand(ctx context.Context, cmd *exec.Cmd) ([]byte, []byte, error) {
 	stdoutFile, err := os.CreateTemp("", "ghrouter-discovery-stdout-")
 	if err != nil {
@@ -640,9 +1463,18 @@ func runBoundedCommand(ctx context.Context, cmd *exec.Cmd) ([]byte, []byte, erro
 	defer stderrFile.Close()
 	cmd.Stdout = stdoutFile
 	cmd.Stderr = stderrFile
+	cmd.WaitDelay = 500 * time.Millisecond
 	if err := cmd.Start(); err != nil {
 		return nil, nil, err
 	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			killDiscoveryProcess(cmd)
+		case <-done:
+		}
+	}()
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 	var runErr error
@@ -650,10 +1482,14 @@ func runBoundedCommand(ctx context.Context, cmd *exec.Cmd) ([]byte, []byte, erro
 	case runErr = <-waitCh:
 	case <-ctx.Done():
 		killDiscoveryProcess(cmd)
-		runErr = <-waitCh
+		runErr, _ = waitDiscoveryProcess(waitCh)
 		if runErr == nil {
 			runErr = ctx.Err()
 		}
+	}
+	close(done)
+	if runErr == nil && ctx.Err() != nil {
+		runErr = ctx.Err()
 	}
 	if runErr != nil {
 		stdout, _ := os.ReadFile(stdoutPath)
