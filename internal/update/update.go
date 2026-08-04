@@ -2,6 +2,8 @@ package update
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -22,6 +24,7 @@ type Release struct {
 type Asset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
+	Digest             string `json:"digest,omitempty"`
 }
 
 type Fetcher interface {
@@ -45,21 +48,22 @@ func (OSFileSystem) Replace(oldpath, newpath string) error { return os.Rename(ne
 func (OSFileSystem) Stat(path string) (os.FileInfo, error) { return os.Stat(path) }
 
 type Client struct {
-	Repo       string
-	APBaseURL   string
-	HTTP       Fetcher
-	FS         FileSystem
-	Version    string
-	GOOS       string
-	GOARCH     string
+	Repo      string
+	APBaseURL string
+	HTTP      Fetcher
+	FS        FileSystem
+	Version   string
+	GOOS      string
+	GOARCH    string
 }
 
 type Result struct {
-	CurrentVersion string `json:"current_version"`
+	CurrentVersion  string `json:"current_version"`
 	LatestVersion   string `json:"latest_version"`
 	UpdateAvailable bool   `json:"update_available"`
 	AssetName       string `json:"asset_name,omitempty"`
 	AssetURL        string `json:"asset_url,omitempty"`
+	AssetDigest     string `json:"asset_digest,omitempty"`
 	Applied         bool   `json:"applied"`
 	TargetPath      string `json:"target_path,omitempty"`
 }
@@ -69,13 +73,13 @@ func NewClient(repo, baseURL, version string, httpClient Fetcher, fs FileSystem)
 		baseURL = "https://api.github.com"
 	}
 	return &Client{
-		Repo:     repo,
+		Repo:      repo,
 		APBaseURL: baseURL,
-		HTTP:     httpClient,
-		FS:       fs,
-		Version:  version,
-		GOOS:     runtime.GOOS,
-		GOARCH:   runtime.GOARCH,
+		HTTP:      httpClient,
+		FS:        fs,
+		Version:   version,
+		GOOS:      runtime.GOOS,
+		GOARCH:    runtime.GOARCH,
 	}
 }
 
@@ -111,6 +115,7 @@ func (c *Client) Check(ctx context.Context) (*Result, error) {
 	if asset := c.selectAsset(rel.Assets); asset != nil {
 		res.AssetName = asset.Name
 		res.AssetURL = asset.BrowserDownloadURL
+		res.AssetDigest = asset.Digest
 	}
 	return res, nil
 }
@@ -150,10 +155,28 @@ func (c *Client) Apply(ctx context.Context, targetPath string) (*Result, error) 
 		return nil, err
 	}
 	tmpPath := tmp.Name()
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, hash), resp.Body); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
 		return nil, err
+	}
+	expectedDigest := strings.TrimPrefix(strings.TrimSpace(check.AssetDigest), "sha256:")
+	if strings.TrimSpace(check.AssetDigest) == "" || expectedDigest == strings.TrimSpace(check.AssetDigest) || len(expectedDigest) != sha256.Size*2 {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("update release is missing a valid sha256 digest")
+	}
+	if _, err := hex.DecodeString(expectedDigest); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("update release is missing a valid sha256 digest: %w", err)
+	}
+	actualDigest := hex.EncodeToString(hash.Sum(nil))
+	if !strings.EqualFold(expectedDigest, actualDigest) {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return nil, fmt.Errorf("update checksum mismatch: expected %s got %s", expectedDigest, actualDigest)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpPath)

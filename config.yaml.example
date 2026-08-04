@@ -3,16 +3,65 @@
 
 listen_port: 9090
 
+# Explicitly limit paid harnesses and prefer free/low-cost upstream capacity.
+model_policy:
+  allowed: ["oc/*", "nv/*", "mi/*", "pi/*", "cu/cursor-grok-*", "cu/composer*", "local/*", "cx/*sol", "cx/*terra", "cx/*luna", "cx/gpt-5.4-mini", "cc/*opus-5", "cc/*sonnet-5", "cc/*haiku-4-5"]
+  preferred: ["oc/*", "nv/*"]
+  max_cost_micros: 0                 # known token cost ceiling; 0 = unlimited
+  max_discovery_age: "0s"            # reject stale native metadata; 0 = unlimited
+
+# Optional local model runtime. It is disabled by default because downloading
+# a model requires an explicit Hugging Face source and consumes disk/network.
+local_brain:
+  enabled: false
+  managed_externally: false          # true when launchd owns mlx_lm.server
+  auto_provision: false
+  allow_model_switch: false
+  backend: ""                         # macOS prefers mlx; Linux/Windows llama.cpp
+  model: ""                           # announced model ID; files default to .localmodel/<owner>/<model>
+  source: ""                           # hf://owner/repository or an explicit local .localmodel path
+  host: "127.0.0.1"
+  port: 8080
+  startup_timeout: "60s"
+  restart: false
+  restart_backoff: "1s"
+  max_restarts: 3
+
+storage:
+  enabled: true                         # local WAL SQLite for redacted operations
+  path: ""                              # empty = user cache/ghrouter/ghrouter.db
+  retention_days: 30                     # 0 = retain raw history indefinitely
+
+acl:
+  enabled: false                         # enable loopback client authentication
+  allow: ["127.0.0.1"]
+  token_env: "GHR_ACCESS_TOKEN"
+  keys_file: ""                          # empty = user cache/ghrouter/client-keys.json
+  scopes: {}                              # optional per-client endpoint overrides
+
+rate_limit:
+  enabled: false
+  requests_per_minute: 120
+  burst: 20
+
+# Named control-plane resources. Members use canonical provider/model IDs or
+# model prefixes. These names are also exposed as virtual models to clients.
+connections: []
+pools: []
+combos: []
+
 # Provider definitions — auto-discovered at startup if missing
 # Each provider maps to a local CLI binary
 providers:
   - name: "claude-code"
-    type: "claude-code"                    # one of: claude-code, codex, opencode, mimo, pi, openai, anthropic, azure, ollama, custom
+    type: "claude-code"                    # one of: claude-code, codex, opencode, mimo, pi, cursor, openai, anthropic, azure, ollama, custom
     cli_path: ""                           # empty = auto-discover on PATH
-    args: ["--print", "--output-format=stream-json", "--no-session-persistence"]
+    args: ["--print", "--output-format=stream-json", "--verbose", "--no-session-persistence"]
     env: {}                                # extra env vars (merged with inherited auth vars)
-    models: []                             # empty = use built-in aliases
+    models: []                             # empty = use native discovery; explicit entries are retained as overrides
     timeout: "5m"                          # request timeout
+    retries: 1
+    retry_backoff: "150ms"
     max_tokens: 128000                     # max tokens per request
     work_dir: ""                           # empty = current directory
     auth_method: "env"                     # env, file, subprocess, none
@@ -23,8 +72,10 @@ providers:
     cli_path: ""
     args: ["exec", "--json", "--ephemeral", "--skip-git-repo-check"]
     env: {}
-    models: []
+    models: []                             # native discovery refreshes this catalog on sync
     timeout: "5m"
+    retries: 1
+    retry_backoff: "150ms"
     max_tokens: 128000
     work_dir: ""
     auth_method: "env"
@@ -33,7 +84,7 @@ providers:
   - name: "opencode"
     type: "opencode"
     cli_path: ""
-    args: ["run", "--format", "json", "--no-remote"]
+    args: ["run", "--format", "json", "--pure"]
     env: {}
     models: []
     timeout: "5m"
@@ -54,10 +105,39 @@ providers:
     auth_method: "env"
     enabled: true
 
+  # NVIDIA NIM is explicit-only; never invent hosted model IDs.
+  - name: "nvidia"
+    type: "nvidia"
+    base_url: "https://integrate.api.nvidia.com"
+    models: ["nv/<provider>/<model>"]
+    auth_method: "env"
+    auth_config:
+      api_key_env: "NVIDIA_API_KEY"
+    accounts:
+      - name: "primary"
+        api_key_env: "NVIDIA_API_KEY"
+        enabled: true
+      - name: "secondary"
+        api_key_env: "NVIDIA_API_KEY_SECONDARY"
+        enabled: true
+    enabled: false
+
   - name: "pi"
     type: "pi"
     cli_path: ""
     args: ["--mode", "json", "--print", "--no-session", "--no-context-files"]
+    env: {}
+    models: []
+    timeout: "5m"
+    max_tokens: 128000
+    work_dir: ""
+    auth_method: "env"
+    enabled: true
+
+  - name: "cursor"
+    type: "cursor"
+    cli_path: ""
+    args: ["agent", "-p", "--output-format", "stream-json", "--stream-partial-output"] # ACP uses agent --trust acp when confirmed
     env: {}
     models: []
     timeout: "5m"
@@ -73,7 +153,7 @@ routes:
   - pattern: "cc/*"
     provider: "claude-code"
     fallback: ["codex", "opencode"]
-    mode: "fallback"                      # fallback, round-robin, fusion, sticky, auto
+    mode: "fallback"                      # fallback, round-robin, fusion, graph, sticky, auto
 
   - pattern: "cx/*"
     provider: "codex"
@@ -95,6 +175,11 @@ routes:
     fallback: ["claude-code", "codex"]
     mode: "fallback"
 
+  - pattern: "cu/*"
+    provider: "cursor"
+    fallback: ["codex", "opencode"]
+    mode: "fallback"
+
   # Combo modes (no prefix)
   - pattern: "auto/*"
     provider: "auto"                      # picks best by health/latency/capability
@@ -107,7 +192,12 @@ routes:
     mode: "round-robin"
 
   - pattern: "fusion/*"
-    provider: "fusion"                    # parallel, returns first complete
+    provider: "fusion"                    # fan-out candidates, optional judge
+    judge: ""                              # optional provider/model judge
+    max_candidates: 0                      # 0 = all healthy candidates
+    judge_timeout: "30s"                   # bounded judge execution
+    first_complete: false                  # cancel siblings after first valid result
+    max_cost_micros: 0                     # optional known token budget; 0 = unlimited
     fallback: ["cc/claude-opus-5", "cx/o3", "oc/sonnet"]
     mode: "fusion"
 
@@ -121,21 +211,35 @@ cooldown:
   enabled: true
   default_duration: "60s"                 # cooldown after error/timeout
   max_duration: "300s"
-  error_threshold: 3                      # consecutive errors before cooldown
-  timeout_threshold: 2                    # consecutive timeouts before cooldown
+
+# Provider circuit breaker settings
+circuit:
+  enabled: true
+  failure_threshold: 3
+  open_duration: "30s"
 
 # Health check settings
 health:
   interval: "30s"                         # periodic check interval
   timeout: "10s"                          # single check timeout
-  test_prompt: "ping"                     # prompt used for health checks
+  test_prompt: "ping"                     # reserved; use probe/verification for real calls
   enabled: true
+
+# Real model verification is opt-in because it consumes provider quota.
+verification:
+  enabled: false
+  startup: false
+  interval: "15m"
+  timeout: "90s"
+  workers: 4
+  batch_size: 32
+  max_per_provider: 8
 
 # Logging
 logging:
   level: "info"                           # debug, info, warn, error
   format: "json"                          # json, text
-  output: "stdout"                        # stdout, stderr, file
+  output: "stderr"                        # stdout, stderr, file
 
 # Server settings
 server:

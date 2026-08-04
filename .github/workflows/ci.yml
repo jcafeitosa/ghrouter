@@ -37,8 +37,13 @@ jobs:
       - name: Run vet
         run: go vet ./...
 
-      - name: Run tests
-        run: go test ./...
+      - name: Run staticcheck
+        uses: dominikh/staticcheck-action@v1.4.1
+        with:
+          install-go: false
 
       - name: Build packages
         run: go build ./...
+
+      - name: Run tests
+        run: go test -race -count=1 -timeout 5m ./...

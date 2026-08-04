@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -23,8 +24,12 @@ type Loop struct {
 	debounceCount  int
 	debounceWindow time.Duration
 	stopCh         chan struct{}
+	stopOnce       sync.Once
+	startOnce      sync.Once
+	wakeCh         chan struct{}
 	wg             sync.WaitGroup
 	onChange       func(provider string, old, new HealthStatus)
+	onSample       func(HealthCheckResult)
 }
 
 type Snapshot struct {
@@ -41,6 +46,7 @@ func NewLoop(interval, timeout time.Duration) *Loop {
 		debounceCount:  2, // require 2 consecutive failures to mark unhealthy
 		debounceWindow: 30 * time.Second,
 		stopCh:         make(chan struct{}),
+		wakeCh:         make(chan struct{}, 1),
 	}
 }
 
@@ -63,22 +69,80 @@ func (l *Loop) SetOnChange(fn func(provider string, old, new HealthStatus)) {
 	l.onChange = fn
 }
 
+func (l *Loop) SetOnSample(fn func(HealthCheckResult)) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.onSample = fn
+}
+
+func (l *Loop) RecordSuccess(provider string, latency time.Duration) {
+	if l == nil || provider == "" {
+		return
+	}
+	now := time.Now()
+	l.mu.Lock()
+	previous := l.results[provider]
+	if previous == nil {
+		previous = &HealthCheckResult{Provider: provider}
+		l.results[provider] = previous
+	}
+	oldStatus := previous.Status
+	previous.Status = HealthHealthy
+	previous.Latency = latency
+	previous.Error = nil
+	previous.Timestamp = now
+	previous.ConsecutiveErrors = 0
+	previous.ConsecutiveTimeouts = 0
+	onChange := l.onChange
+	onSample := l.onSample
+	sample := *previous
+	l.mu.Unlock()
+	if onChange != nil && oldStatus != HealthHealthy {
+		onChange(provider, oldStatus, HealthHealthy)
+	}
+	if onSample != nil {
+		onSample(sample)
+	}
+}
+
+func (l *Loop) Settings() (time.Duration, time.Duration) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.interval, l.timeout
+}
+
+func (l *Loop) SetSettings(interval, timeout time.Duration) {
+	if interval <= 0 || timeout <= 0 {
+		return
+	}
+	l.mu.Lock()
+	l.interval = interval
+	l.timeout = timeout
+	l.mu.Unlock()
+	select {
+	case l.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
 func (l *Loop) Start(ctx context.Context) {
-	l.wg.Add(1)
-	go l.run(ctx)
+	l.startOnce.Do(func() {
+		l.wg.Add(1)
+		go l.run(ctx)
+	})
 }
 
 func (l *Loop) Stop() {
-	close(l.stopCh)
+	l.stopOnce.Do(func() { close(l.stopCh) })
 	l.wg.Wait()
 }
 
 func (l *Loop) run(ctx context.Context) {
 	defer l.wg.Done()
 
-	ticker := time.NewTicker(l.interval)
-	defer ticker.Stop()
 	l.checkAll(ctx)
+	timer := time.NewTimer(l.currentInterval())
+	defer timer.Stop()
 
 	for {
 		select {
@@ -86,10 +150,28 @@ func (l *Loop) run(ctx context.Context) {
 			return
 		case <-l.stopCh:
 			return
-		case <-ticker.C:
+		case <-l.wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(l.currentInterval())
+		case <-timer.C:
 			l.checkAll(ctx)
+			timer.Reset(l.currentInterval())
 		}
 	}
+}
+
+func (l *Loop) currentInterval() time.Duration {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.interval <= 0 {
+		return time.Second
+	}
+	return l.interval
 }
 
 func (l *Loop) checkAll(ctx context.Context) {
@@ -99,10 +181,43 @@ func (l *Loop) checkAll(ctx context.Context) {
 		checkers = append(checkers, checker)
 	}
 	l.mu.RUnlock()
-
-	for _, checker := range checkers {
-		l.checkOne(ctx, checker)
+	if len(checkers) == 0 {
+		return
 	}
+	workers := len(checkers)
+	if workers > 8 {
+		workers = 8
+	}
+	jobs := make(chan HealthChecker)
+	var group sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case checker, ok := <-jobs:
+					if !ok {
+						return
+					}
+					l.checkOne(ctx, checker)
+				}
+			}
+		}()
+	}
+	for _, checker := range checkers {
+		select {
+		case <-ctx.Done():
+			close(jobs)
+			group.Wait()
+			return
+		case jobs <- checker:
+		}
+	}
+	close(jobs)
+	group.Wait()
 }
 
 func (l *Loop) checkOne(ctx context.Context, checker HealthChecker) {
@@ -122,8 +237,16 @@ func (l *Loop) checkOne(ctx context.Context, checker HealthChecker) {
 	}
 	oldStatus := prev.Status
 	if err != nil {
+		if !prev.Timestamp.IsZero() && l.debounceWindow > 0 && time.Since(prev.Timestamp) > l.debounceWindow {
+			prev.ConsecutiveErrors = 0
+			prev.ConsecutiveTimeouts = 0
+		}
 		prev.ConsecutiveErrors++
-		prev.ConsecutiveTimeouts = 0
+		if errors.Is(err, context.DeadlineExceeded) {
+			prev.ConsecutiveTimeouts++
+		} else {
+			prev.ConsecutiveTimeouts = 0
+		}
 		if prev.ConsecutiveErrors >= l.debounceCount {
 			prev.Status = HealthUnhealthy
 		} else {
@@ -139,11 +262,16 @@ func (l *Loop) checkOne(ctx context.Context, checker HealthChecker) {
 	prev.Latency = latency
 	prev.Timestamp = time.Now()
 	onChange := l.onChange
+	onSample := l.onSample
 	newStatus := prev.Status
+	sample := *prev
 	l.mu.Unlock()
 
 	if onChange != nil && newStatus != oldStatus {
 		onChange(key, oldStatus, newStatus)
+	}
+	if onSample != nil {
+		onSample(sample)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -12,13 +13,37 @@ import (
 type BackendType string
 
 const (
-	BackendMLX      BackendType = "mlx"
-	BackendLLAMACPP BackendType = "llama.cpp"
-	BackendNone     BackendType = "none"
+	BackendMLX         BackendType = "mlx"
+	BackendLLAMACPP    BackendType = "llama.cpp"
+	BackendExternalCLI BackendType = "external-cli"
+	BackendNone        BackendType = "none"
 )
 
 // Detector checks for MLX or llama.cpp availability
 type Detector struct{}
+
+type HostCapabilities struct {
+	OS                string      `json:"os"`
+	Architecture      string      `json:"architecture"`
+	PreferredBackend  BackendType `json:"preferred_backend"`
+	DetectedBackend   BackendType `json:"detected_backend"`
+	MLXAvailable      bool        `json:"mlx_available"`
+	LlamaCppAvailable bool        `json:"llama_cpp_available"`
+}
+
+func (d *Detector) HostCapabilities() HostCapabilities {
+	host := HostCapabilities{OS: runtime.GOOS, Architecture: runtime.GOARCH, PreferredBackend: preferredBackendForHost()}
+	host.MLXAvailable = d.isMLXAvailable()
+	host.LlamaCppAvailable = d.isLlamaCppAvailable()
+	if host.MLXAvailable {
+		host.DetectedBackend = BackendMLX
+	} else if host.LlamaCppAvailable {
+		host.DetectedBackend = BackendLLAMACPP
+	} else {
+		host.DetectedBackend = BackendNone
+	}
+	return host
+}
 
 func (d *Detector) Detect() (BackendType, error) {
 	if d.isMLXAvailable() {
@@ -76,11 +101,17 @@ type ModelManager struct {
 }
 
 func NewModelManager() (*ModelManager, error) {
-	home := os.Getenv("HOME")
-	if home == "" {
-		home = "/tmp"
+	cacheDir := strings.TrimSpace(os.Getenv("GHR_LOCAL_MODEL_ROOT"))
+	if cacheDir == "" {
+		cacheDir = ".localmodel"
 	}
-	cacheDir := filepath.Join(home, ".cache", "ghrouter", "models")
+	if !filepath.IsAbs(cacheDir) {
+		workingDir, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("resolve local model root: %w", err)
+		}
+		cacheDir = filepath.Join(workingDir, cacheDir)
+	}
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -111,6 +142,9 @@ func (m *ModelManager) CacheDir() string {
 }
 
 func (m *ModelManager) EnsureModelAvailable(backend BackendType, modelID string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("model manager not configured")
+	}
 	switch backend {
 	case BackendMLX:
 		return m.ensureMLXModel(modelID)
@@ -122,30 +156,73 @@ func (m *ModelManager) EnsureModelAvailable(backend BackendType, modelID string)
 }
 
 func (m *ModelManager) ensureMLXModel(modelID string) (string, error) {
-	modelDir := filepath.Join(m.cacheDir, "mlx", modelID)
-	if _, err := os.Stat(modelDir); err == nil {
+	if filepath.IsAbs(strings.TrimSpace(modelID)) {
+		if info, err := os.Stat(modelID); err == nil && info.IsDir() {
+			return modelID, nil
+		}
+	}
+	if relative := localModelRelativePath(modelID); relative != "" {
+		modelDir := filepath.Join(m.cacheDir, relative)
+		if info, err := os.Stat(modelDir); err == nil && info.IsDir() {
+			return modelDir, nil
+		}
+	}
+	slug := sanitizeModelSlug(modelID)
+	if slug == "" {
+		return "", fmt.Errorf("mlx model %q has an invalid cache name", modelID)
+	}
+	modelDir := filepath.Join(m.cacheDir, "mlx", slug)
+	if info, err := os.Stat(modelDir); err == nil && info.IsDir() {
 		return modelDir, nil
 	}
 	return "", fmt.Errorf("mlx model %q not found in cache", modelID)
 }
 
+func localModelRelativePath(model string) string {
+	model = strings.TrimSpace(model)
+	model = strings.TrimPrefix(model, "hf://")
+	model = strings.TrimPrefix(model, "huggingface://")
+	model = strings.TrimPrefix(model, "hf/")
+	if model == "" || filepath.IsAbs(model) {
+		return ""
+	}
+	clean := filepath.Clean(filepath.FromSlash(model))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return clean
+}
+
 func (m *ModelManager) ensureLlamaCppModel(modelID string) (string, error) {
-	modelPath := filepath.Join(m.cacheDir, modelID+".gguf")
-	if _, err := os.Stat(modelPath); err == nil {
-		return modelPath, nil
+	slug := sanitizeModelSlug(modelID)
+	if slug == "" {
+		return "", fmt.Errorf("llama.cpp model %q has an invalid cache name", modelID)
+	}
+	modelDir := filepath.Join(m.cacheDir, "llama.cpp", slug)
+	if info, err := os.Stat(modelDir); err == nil {
+		if info.Mode().IsRegular() && strings.EqualFold(filepath.Ext(modelDir), ".gguf") {
+			return modelDir, nil
+		}
+		if info.IsDir() {
+			entries, readErr := os.ReadDir(modelDir)
+			if readErr == nil {
+				for _, entry := range entries {
+					if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".gguf") {
+						continue
+					}
+					return filepath.Join(modelDir, entry.Name()), nil
+				}
+			}
+		}
+	}
+	legacyPath := filepath.Join(m.cacheDir, slug+".gguf")
+	if info, err := os.Stat(legacyPath); err == nil && info.Mode().IsRegular() {
+		return legacyPath, nil
 	}
 	return "", fmt.Errorf("llama.cpp model %q not found in cache", modelID)
 }
 
 func (m *ModelManager) HasModel(backend BackendType, modelID string) bool {
-	switch backend {
-	case BackendMLX:
-		_, err := os.Stat(filepath.Join(m.cacheDir, "mlx", modelID))
-		return err == nil
-	case BackendLLAMACPP:
-		_, err := os.Stat(filepath.Join(m.cacheDir, modelID+".gguf"))
-		return err == nil
-	default:
-		return false
-	}
+	_, err := m.EnsureModelAvailable(backend, modelID)
+	return err == nil
 }

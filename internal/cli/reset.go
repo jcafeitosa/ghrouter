@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 type resetTarget struct {
@@ -14,6 +15,7 @@ type resetTarget struct {
 	Path     string `json:"path"`
 	Kind     string `json:"kind"`
 	Removed  bool   `json:"removed"`
+	Backup   string `json:"backup,omitempty"`
 }
 
 func discoverResetTargets() []resetTarget {
@@ -82,18 +84,29 @@ func dedupeTargets(targets []resetTarget) []resetTarget {
 	return out
 }
 
-func removeResetTarget(path string) error {
+func backupResetTarget(path, backupRoot string, index int) (string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return "", nil
 		}
-		return err
+		return "", err
 	}
-	if info.IsDir() {
-		return os.RemoveAll(path)
+	if !info.IsDir() && !info.Mode().IsRegular() {
+		return "", fmt.Errorf("unsupported reset target: %s", path)
 	}
-	return os.Remove(path)
+	if err := os.MkdirAll(backupRoot, 0o700); err != nil {
+		return "", err
+	}
+	backup := filepath.Join(backupRoot, fmt.Sprintf("%03d-%s", index, filepath.Base(path)))
+	if err := os.Rename(path, backup); err != nil {
+		return "", err
+	}
+	return backup, nil
+}
+
+func resetBackupRoot(home string) string {
+	return filepath.Join(home, ".ghrouter", "backups", time.Now().UTC().Format("20060102T150405.000000000Z"))
 }
 
 func summarizeResetTargets(targets []resetTarget) string {
