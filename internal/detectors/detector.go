@@ -23,7 +23,7 @@ import (
 type Detector struct{ discovered map[string]*types.Provider }
 
 const nativeDiscoveryTimeout = 5 * time.Second
-const acpProbeTimeout = 2 * time.Second
+const acpProbeTimeout = 3 * time.Second
 const discoveryCacheTTL = 15 * time.Second
 
 var discoveryCache struct {
