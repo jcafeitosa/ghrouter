@@ -5,10 +5,20 @@ package resourcegov
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 )
+
+func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 500 * time.Millisecond
+	return cmd.Output()
+}
 
 func NewSystemSampler() *SystemSampler {
 	return &SystemSampler{now: time.Now, run: commandOutput}

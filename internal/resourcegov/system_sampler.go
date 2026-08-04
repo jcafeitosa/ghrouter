@@ -2,7 +2,6 @@ package resourcegov
 
 import (
 	"context"
-	"os/exec"
 	"time"
 )
 
@@ -14,15 +13,6 @@ type SystemSampler struct {
 }
 
 type timefunc func() time.Time
-
-func commandOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.WaitDelay = 500 * time.Millisecond
-	return cmd.Output()
-}
 
 func unavailableSample(now time.Time) Sample {
 	reading := Reading{Status: MetricUnavailable}

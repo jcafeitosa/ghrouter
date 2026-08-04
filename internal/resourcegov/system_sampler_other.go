@@ -17,5 +17,8 @@ func (s *SystemSampler) Sample(_ context.Context) (Sample, error) {
 	if s != nil && s.now != nil {
 		now = s.now()
 	}
+	if s != nil && s.run != nil {
+		return unavailableSample(now), fmt.Errorf("system sampler unavailable on this platform")
+	}
 	return unavailableSample(now), fmt.Errorf("system sampler unavailable on this platform")
 }
