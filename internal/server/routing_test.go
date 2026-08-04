@@ -555,8 +555,8 @@ func TestChatCompletionsFallsBackAfterProviderExecutionFailure(t *testing.T) {
 
 	srv := New(&types.Config{
 		Providers: []*types.Provider{
-			{Name: "primary", Type: types.ProviderCustom, CLIPath: primary, Models: []string{"model-a"}, WorkDir: tmpDir, Enabled: true},
-			{Name: "backup", Type: types.ProviderCustom, CLIPath: backup, Models: []string{"model-b"}, WorkDir: tmpDir, Enabled: true},
+			{Name: "primary", Type: types.ProviderOpenCode, CLIPath: primary, Models: []string{"model-a"}, WorkDir: tmpDir, Enabled: true},
+			{Name: "backup", Type: types.ProviderOpenCode, CLIPath: backup, Models: []string{"model-b"}, WorkDir: tmpDir, Enabled: true},
 		},
 		Routes: []*types.Route{{Pattern: "auto/*", Provider: "primary", Fallback: []string{"backup"}}},
 	})
@@ -797,8 +797,8 @@ func TestExplicitUnhealthyModelUsesConfiguredFallback(t *testing.T) {
 	}
 	srv := New(&types.Config{
 		Providers: []*types.Provider{
-			{Name: "primary", Type: types.ProviderCustom, CLIPath: primary, Models: []string{"model-a"}, WorkDir: tmpDir, Enabled: true},
-			{Name: "backup", Type: types.ProviderCustom, CLIPath: backup, Models: []string{"model-b"}, WorkDir: tmpDir, Enabled: true},
+			{Name: "primary", Type: types.ProviderOpenCode, CLIPath: primary, Models: []string{"model-a"}, WorkDir: tmpDir, Enabled: true},
+			{Name: "backup", Type: types.ProviderOpenCode, CLIPath: backup, Models: []string{"model-b"}, WorkDir: tmpDir, Enabled: true},
 		},
 		Routes: []*types.Route{{Pattern: "primary/*", Provider: "primary", Fallback: []string{"backup"}}},
 	})
