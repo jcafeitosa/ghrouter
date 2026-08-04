@@ -2248,6 +2248,9 @@ func TestRunBootstrapJSONCommand(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "bootstrap.yaml")
 	t.Setenv("GHR_CONFIG", cfgPath)
+	if err := os.WriteFile(cfgPath, []byte("listen_port: 9090\nproviders:\n  - name: unavailable\n    type: custom\n    cli_path: /missing/provider\n    models: [unavailable/model]\n    enabled: true\nroutes: []\n"), 0o600); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
 
 	old := newBootstrapper
 	t.Cleanup(func() { newBootstrapper = old })
@@ -2290,7 +2293,7 @@ func TestRunProvisionJSONCommand(t *testing.T) {
 	tmpDir := t.TempDir()
 	cfgPath := filepath.Join(tmpDir, "provision.yaml")
 	t.Setenv("GHR_CONFIG", cfgPath)
-	if err := os.WriteFile(cfgPath, []byte("listen_port: 9090\nproviders: []\nroutes: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("listen_port: 9090\nproviders:\n  - name: unavailable\n    type: custom\n    cli_path: /missing/provider\n    models: [unavailable/model]\n    enabled: true\nroutes: []\n"), 0o600); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
 
@@ -2313,7 +2316,7 @@ func TestRunProvisionApplyWritesPlan(t *testing.T) {
 	t.Setenv("GHR_LOCAL_MODEL_ROOT", modelRoot)
 
 	cfgPath := filepath.Join(home, "provision-apply.yaml")
-	if err := os.WriteFile(cfgPath, []byte("listen_port: 9090\nproviders: []\nroutes: []\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfgPath, []byte("listen_port: 9090\nproviders:\n  - name: unavailable\n    type: custom\n    cli_path: /missing/provider\n    models: [unavailable/model]\n    enabled: true\nroutes: []\n"), 0o600); err != nil {
 		t.Fatalf("seed config: %v", err)
 	}
 	t.Setenv("GHR_CONFIG", cfgPath)

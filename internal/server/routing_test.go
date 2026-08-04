@@ -548,7 +548,7 @@ func TestChatCompletionsFallsBackAfterProviderExecutionFailure(t *testing.T) {
 	if err := os.WriteFile(primary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 		t.Fatalf("write primary cli: %v", err)
 	}
-	backupScript := "#!/bin/sh\ncase \"$*\" in *'-m model-b'*) printf '{\\\"text\\\":\\\"fallback ok\\\"}\\n' ;; *) exit 2 ;; esac\n"
+	backupScript := "#!/bin/sh\ncase \"$*\" in *model-b*) printf '{\\\"text\\\":\\\"fallback ok\\\"}\\n' ;; *) exit 2 ;; esac\n"
 	if err := os.WriteFile(backup, []byte(backupScript), 0o755); err != nil {
 		t.Fatalf("write backup cli: %v", err)
 	}
@@ -845,7 +845,7 @@ func TestStreamingChatFallsBackBeforeHeaders(t *testing.T) {
 	if err := os.WriteFile(primary, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 		t.Fatalf("write primary cli: %v", err)
 	}
-	backupScript := "#!/bin/sh\ncase \"$*\" in *'-m model-b'*) printf '{\\\"text\\\":\\\"stream fallback ok\\\"}\\n' ;; *) exit 2 ;; esac\n"
+	backupScript := "#!/bin/sh\ncase \"$*\" in *model-b*) printf '{\\\"text\\\":\\\"stream fallback ok\\\"}\\n' ;; *) exit 2 ;; esac\n"
 	if err := os.WriteFile(backup, []byte(backupScript), 0o755); err != nil {
 		t.Fatalf("write backup cli: %v", err)
 	}
