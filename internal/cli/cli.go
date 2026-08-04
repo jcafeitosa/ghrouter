@@ -364,7 +364,7 @@ func (r *Runner) doctor() int {
 			return 1
 		}
 		fmt.Fprintln(r.Stdout, string(payload))
-		if err != nil {
+		if err != nil || !routerReady {
 			fmt.Fprintln(r.Stderr, err)
 			return 1
 		}
@@ -384,7 +384,7 @@ func (r *Runner) doctor() int {
 	for _, suggestion := range report.Summary().Suggestions {
 		fmt.Fprintf(r.Stdout, "suggestion\t%s\n", suggestion)
 	}
-	if err != nil {
+	if err != nil || !routerReady {
 		fmt.Fprintln(r.Stderr, err)
 		return 1
 	}
@@ -981,7 +981,7 @@ func (r *Runner) bootstrap() int {
 			return 1
 		}
 		fmt.Fprintln(r.Stdout, string(b))
-		if err != nil {
+		if err != nil || !summary.Ready {
 			fmt.Fprintln(r.Stderr, err)
 			return 1
 		}
@@ -1002,7 +1002,7 @@ func (r *Runner) bootstrap() int {
 	for _, suggestion := range summary.Suggestions {
 		fmt.Fprintf(r.Stdout, "suggestion\t%s\n", suggestion)
 	}
-	if err != nil {
+	if err != nil || !summary.Ready {
 		fmt.Fprintln(r.Stderr, err)
 		return 1
 	}
@@ -1052,7 +1052,7 @@ func (r *Runner) provision(args []string) int {
 			return 1
 		}
 		fmt.Fprintln(r.Stdout, string(b))
-		if checkErr != nil {
+		if checkErr != nil || !summary.Ready {
 			fmt.Fprintln(r.Stderr, checkErr)
 			return 1
 		}
@@ -1068,7 +1068,7 @@ func (r *Runner) provision(args []string) int {
 			fmt.Fprintf(r.Stdout, "apply\tpending\t%d action(s) remain\n", len(summary.Provision))
 		}
 	}
-	if checkErr != nil {
+	if checkErr != nil || !summary.Ready {
 		fmt.Fprintln(r.Stderr, checkErr)
 		return 1
 	}

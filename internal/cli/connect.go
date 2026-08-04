@@ -256,6 +256,11 @@ func installCopilotLauncher(absoluteConfig, baseURL string) error {
 }
 
 func realCopilotPath(launcher string) string {
+	if path := strings.TrimSpace(os.Getenv("GHR_COPILOT_BIN")); path != "" && filepath.Clean(path) != filepath.Clean(launcher) {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path
+		}
+	}
 	candidates := []string{"/opt/homebrew/bin/copilot", "/usr/local/bin/copilot"}
 	for _, candidate := range candidates {
 		if candidate != launcher {

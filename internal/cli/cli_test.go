@@ -296,6 +296,7 @@ func TestConnectInstallsPiProfile(t *testing.T) {
 func TestInstallCopilotLauncherPreservesExplicitProviderEndpoint(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	seedFakeCopilot(t)
 	router := filepath.Join(home, "ghrouter")
 	if err := os.WriteFile(router, []byte("router-build-fixture"), 0o700); err != nil {
 		t.Fatalf("write router fixture: %v", err)
@@ -317,6 +318,7 @@ func TestInstallCopilotLauncherPreservesExplicitProviderEndpoint(t *testing.T) {
 func TestInstallCopilotLauncherWaitsForRouterReadiness(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	seedFakeCopilot(t)
 	router := filepath.Join(home, "ghrouter")
 	if err := os.WriteFile(router, []byte("router-build-fixture"), 0o700); err != nil {
 		t.Fatalf("write router fixture: %v", err)
@@ -340,6 +342,7 @@ func TestInstallCopilotLauncherWaitsForRouterReadiness(t *testing.T) {
 
 func TestInstallCopilotLauncherEmbedsRouterBuildIdentity(t *testing.T) {
 	home := t.TempDir()
+	seedFakeCopilot(t)
 	router := filepath.Join(home, "bin", "ghrouter")
 	if err := os.MkdirAll(filepath.Dir(router), 0o700); err != nil {
 		t.Fatalf("create router fixture directory: %v", err)
@@ -363,6 +366,25 @@ func TestInstallCopilotLauncherEmbedsRouterBuildIdentity(t *testing.T) {
 	if !strings.Contains(content, `binary_sha256`) {
 		t.Fatalf("launcher does not validate health identity: %s", content)
 	}
+}
+
+func seedFakeCopilot(t *testing.T) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "copilot")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatalf("write copilot fixture: %v", err)
+	}
+	t.Setenv("GHR_COPILOT_BIN", path)
+}
+
+func writeFixtureConfig(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := "listen_port: 0\nproviders:\n  - name: fixture\n    type: custom\n    cli_path: /bin/true\n    models: [fixture/model]\n    enabled: true\nroutes: []\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config fixture: %v", err)
+	}
+	return path
 }
 
 func TestRouterInvocationPrefersCurrentExecutableOverPath(t *testing.T) {
@@ -1472,6 +1494,11 @@ func TestAttachedSourceReadsLiveSnapshotAndBootstrap(t *testing.T) {
 }
 
 func TestLiveActionResetPreviewReturnsResult(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".claude"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	model := newLiveTUIModel(&types.Config{}, "config.yaml")
 	cmd := model.runActionCmd(liveActionResetPreview)
 	if cmd == nil {
@@ -1603,7 +1630,7 @@ func TestRunUpdateJSONCommand(t *testing.T) {
 		switch r.URL.Path {
 		case "/repos/jcafeitosa/ghrouter/releases/latest":
 			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[{"name":"ghrouter_darwin_arm64","browser_download_url":"`+baseURL+`/asset"}]}`)
+			_, _ = fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[{"name":"ghrouter_`+runtime.GOOS+`_`+runtime.GOARCH+`","browser_download_url":"`+baseURL+`/asset"}]}`)
 		case "/asset":
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "new-binary")
@@ -1636,7 +1663,7 @@ func TestRunUpdateApplyWritesTarget(t *testing.T) {
 		switch r.URL.Path {
 		case "/repos/jcafeitosa/ghrouter/releases/latest":
 			w.WriteHeader(http.StatusOK)
-			_, _ = fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[{"name":"ghrouter_darwin_arm64","browser_download_url":"`+baseURL+`/asset","digest":"sha256:`+hex.EncodeToString(digest[:])+`"}]}`)
+			_, _ = fmt.Fprint(w, `{"tag_name":"v9.9.9","assets":[{"name":"ghrouter_`+runtime.GOOS+`_`+runtime.GOARCH+`","browser_download_url":"`+baseURL+`/asset","digest":"sha256:`+hex.EncodeToString(digest[:])+`"}]}`)
 		case "/asset":
 			w.WriteHeader(http.StatusOK)
 			_, _ = fmt.Fprint(w, "new-binary")
@@ -1755,9 +1782,10 @@ func TestPrintStartupStatusReportsMissingAuthWithoutFailing(t *testing.T) {
 }
 
 func TestRunLiveJSONCommandProducesSnapshot(t *testing.T) {
+	cfgPath := writeFixtureConfig(t)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	r := &Runner{Stdout: &stdout, Stderr: &stderr}
+	r := &Runner{Stdout: &stdout, Stderr: &stderr, Config: cfgPath}
 
 	code := r.Run(context.Background(), []string{"--json", "live"})
 	if code != 0 {
@@ -1772,9 +1800,10 @@ func TestRunLiveJSONCommandProducesSnapshot(t *testing.T) {
 }
 
 func TestRunProvidersJSONCommand(t *testing.T) {
+	cfgPath := writeFixtureConfig(t)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	r := &Runner{Stdout: &stdout, Stderr: &stderr}
+	r := &Runner{Stdout: &stdout, Stderr: &stderr, Config: cfgPath}
 
 	code := r.Run(context.Background(), []string{"--json", "providers"})
 	if code != 0 {

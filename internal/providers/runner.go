@@ -359,6 +359,8 @@ func (r *ProviderRunner) executeCLIOnce(ctx context.Context, req *types.OpenAIRe
 		select {
 		case <-commandCtx.Done():
 			killProviderProcess(cmd)
+			_ = stdout.Close()
+			_ = stderr.Close()
 		case <-processDone:
 		}
 	}()
@@ -392,6 +394,9 @@ func (r *ProviderRunner) executeCLIOnce(ctx context.Context, req *types.OpenAIRe
 	}
 	if err := scanner.Err(); err != nil {
 		_ = cmd.Wait()
+		if commandErr := commandCtx.Err(); commandErr != nil {
+			return commandErr
+		}
 		return err
 	}
 
